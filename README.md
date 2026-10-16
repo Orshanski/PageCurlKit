@@ -165,6 +165,10 @@ final class MiniPagerViewController: UIViewController, PageCurlHost {
   (video, Metal) will be missing from the curl.
 - **`enqueue` serializes steps**: the next one starts after the previous one
   ends. A host without a queue runs the step right away.
+- **Neighbours are symmetric.** Turning back from a neighbour leads to the
+  spread you came from. After a turn the library keeps the target snapshot as
+  current and the old current as the neighbour behind, and snapshots only the
+  new neighbour ahead.
 
 ## Configuration
 

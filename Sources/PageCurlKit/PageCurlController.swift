@@ -124,10 +124,13 @@ public final class PageCurlController<Host: PageCurlHost> {
         // Weak captures only: the step waits until the animation ends, and a strong reference
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
         host.enqueue { [weak self, weak host] in
-            guard let shown = await host?.showTarget(forward: forward) else { return }
+            guard let host else { return }
+            let from = host.currentPosition
+            let shown = await host.showTarget(forward: forward)
             if shown {
                 if let self {
                     self.lastShownAt = self.now()
+                    self.shiftCache(forward: forward, from: from, to: host.currentPosition)
                 }
             } else {
                 // The host provided a neighbour view but then could not show it: an integration bug.
@@ -181,11 +184,26 @@ public final class PageCurlController<Host: PageCurlHost> {
     private func enqueueInstantShow(forward: Bool, host: Host) {
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
+            let from = host.currentPosition
             let shown = await host.showTarget(forward: forward)
             if shown, let self {
                 self.lastShownAt = self.now()
+                self.shiftCache(forward: forward, from: from, to: host.currentPosition)
             }
         }
+    }
+
+    /// After a one-step turn the target snapshot becomes current and the old current becomes the
+    /// neighbour behind, so only the new neighbour ahead is snapshotted.
+    private func shiftCache(forward: Bool, from: Host.Position, to: Host.Position) {
+        guard from != to, let old = cache, old.position == from,
+              let target = forward ? old.next : old.previous
+        else { return }
+        cache = SnapshotCache(
+            position: to, size: old.size, current: target,
+            next: forward ? nil : old.current,
+            previous: forward ? old.current : nil
+        )
     }
 
     private func snapshotPair(
@@ -231,7 +249,10 @@ public final class PageCurlController<Host: PageCurlHost> {
     private func snapshot(of view: UIView, size: CGSize, paper: UIColor) -> UIImage {
         assert(view.bounds.size == size, "The host spread view must match the container size")
         view.layoutIfNeeded()
-        return UIGraphicsImageRenderer(size: size).image { context in
+        // 8 bits per channel, what the render expects; a wide-color display would otherwise give 16.
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.preferredRange = .standard
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
             paper.setFill()
             context.fill(CGRect(origin: .zero, size: size))
             view.layer.render(in: context.cgContext)

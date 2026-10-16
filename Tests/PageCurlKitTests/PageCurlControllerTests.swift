@@ -317,12 +317,25 @@ final class PageCurlControllerTests: XCTestCase {
     func testPrefetchWaitsForCurlEndAndRestartsOnRelease() async {
         controller.turn(forward: true, isSpread: false)
         await waitUntil("show") { host.showTargetCalls.count == 1 }
-        let callsDuringCurl = host.currentViewCalls
+        let callsDuringCurl = host.neighbourCalls.count
         controller.prefetch()
-        XCTAssertEqual(host.currentViewCalls, callsDuringCurl, "No rebuild while the curl is running")
+        XCTAssertEqual(host.neighbourCalls.count, callsDuringCurl, "No rebuild while the curl is running")
         factory.made[0].finish()
-        XCTAssertGreaterThan(host.currentViewCalls, callsDuringCurl, "release() restarts the rebuild")
+        XCTAssertGreaterThan(host.neighbourCalls.count, callsDuringCurl, "release() restarts the rebuild")
         await host.drain()
+    }
+
+    func testTurnShiftsCacheInsteadOfResnapshotting() async {
+        controller.prefetch()
+        XCTAssertEqual(host.currentViewCalls, 1)
+        XCTAssertEqual(host.neighbourCalls.count, 2)
+        await completeBeautifulTurn(forward: true)
+        XCTAssertEqual(host.currentViewCalls, 1, "The target snapshot becomes current")
+        XCTAssertEqual(host.neighbourCalls, [true, false, true], "Only the new neighbour ahead is snapshotted")
+        time += 10
+        await completeBeautifulTurn(forward: false)
+        XCTAssertEqual(host.currentViewCalls, 1, "Turning back reuses the old current snapshot")
+        XCTAssertEqual(host.neighbourCalls, [true, false, true, false])
     }
 
     func testTurnUsesPrefetchedCache() async {

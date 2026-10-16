@@ -24,7 +24,8 @@ public protocol PageCurlHost: AnyObject {
     /// The neighbouring spread, sized to the container; it does not need to be on screen. If a view
     /// controller lays it out, keep that controller alive until the next call. Return nil at the
     /// edge of the book or if it is not ready yet; in the latter case start preparing it and call
-    /// `prefetch()` on the controller when it is ready.
+    /// `prefetch()` on the controller when it is ready. Turning back from a neighbour must lead to
+    /// the spread you came from: after a turn the library reuses the old snapshots.
     func neighbourSpreadView(forward: Bool) -> UIView?
 
     /// Show the target spread instantly and return once it is on screen. Return false if there is
