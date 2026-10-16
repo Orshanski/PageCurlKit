@@ -169,6 +169,9 @@ final class MiniPagerViewController: UIViewController, PageCurlHost {
   spread you came from. After a turn the library keeps the target snapshot as
   current and the old current as the neighbour behind, and snapshots only the
   new neighbour ahead.
+- **Expensive spreads are built once.** If building a spread is costly (text
+  layout, PDF rendering), keep the view returned from `neighbourSpreadView`
+  and show that same view in `showTarget` instead of building it again.
 
 ## Configuration
 
