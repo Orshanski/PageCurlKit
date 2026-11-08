@@ -17,11 +17,12 @@ public final class PageCurlController<Host: PageCurlHost> {
     private weak var host: Host?
     private weak var container: UIView?
     private let overlayFactory: PageCurlOverlayFactory
+    /// The curl view for every turn, asked from the factory until it gives one.
     private var overlay: PageCurlOverlayAnimating?
-    /// Numbers the curl runs; a step or callback of an earlier run sees a different number and
-    /// leaves the current run alone.
-    private var runNumber = 0
+    /// The running curl, if any. A queued step of an earlier run sees a different number and leaves
+    /// the current run alone.
     private var activeRun: Int?
+    private var runNumber = 0
     /// Holds the host's queue step until the animation ends; an interruption releases it at once.
     private var holdContinuation: CheckedContinuation<Void, Never>?
     /// Set only after a confirmed show, so a tap at the edge of the book does not block the next turn.
@@ -71,6 +72,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         container.insertSubview(sizeSentinel, at: 0)
         backgroundWatcher = BackgroundWatcher { [weak self] in
             self?.interrupt(reason: "app went to the background")
+            self?.overlay?.releaseTextures()
         }
     }
 
@@ -79,16 +81,24 @@ public final class PageCurlController<Host: PageCurlHost> {
         holdContinuation?.resume()
     }
 
-    /// Compiles the shaders ahead of time. Call it when the pager opens; otherwise the first curl
-    /// drops frames.
+    /// Creates the curl view and compiles its shaders ahead of time. Call it when the pager opens;
+    /// otherwise the first curl drops frames.
     public func warmUp() {
-        overlayFactory.warmUp()
+        _ = curlView()
+    }
+
+    private func curlView() -> PageCurlOverlayAnimating? {
+        if overlay == nil {
+            overlay = overlayFactory.makeOverlay()
+        }
+        return overlay
     }
 
     public func turn(
         forward: Bool, isSpread: Bool,
         progress: PageCurlProgressSource = .timed
     ) {
+        let touchedAt = CACurrentMediaTime()
         // A call during a running curl cancels it and then proceeds as usual.
         interrupt(reason: "a new turn")
         guard let host, let container else { return }
@@ -105,8 +115,8 @@ public final class PageCurlController<Host: PageCurlHost> {
         guard now() - lastShownAt > configuration.duration else {
             return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent")
         }
-        guard overlayFactory.isAvailable else {
-            return enqueueInstantShow(forward: forward, host: host, reason: "no Metal device")
+        guard let overlay = curlView() else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "no curl view (no Metal)")
         }
         guard size.width > 0, size.height > 0 else {
             return enqueueInstantShow(forward: forward, host: host, reason: "empty container")
@@ -114,7 +124,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         guard let pair = snapshotPair(forward: forward, host: host, size: size) else {
             return enqueueInstantShow(forward: forward, host: host, reason: "no snapshots")
         }
-        guard let overlay = overlayFactory.makeOverlay(PageCurlOverlayRequest(
+        guard overlay.prepare(PageCurlOverlayRequest(
             currentSpread: pair.current,
             targetSpread: pair.target,
             sizePoints: size,
@@ -128,19 +138,16 @@ public final class PageCurlController<Host: PageCurlHost> {
 
         runNumber += 1
         let run = runNumber
-        overlay.frame = container.bounds
         container.addSubview(overlay)
-        self.overlay = overlay
         activeRun = run
-        overlay.onFinished = { [weak self] in
-            guard let self, self.activeRun == run else { return }
-            self.release()
-        }
+        overlay.onFinished = { [weak self] in self?.release() }
         curlLog.debug("turn \(run) started: forward \(forward), spread \(isSpread)")
         guard overlay.startIfFirstFrameDrawn() else {
-            dropOverlay()
+            stopRun()
             return enqueueInstantShow(forward: forward, host: host, reason: "first frame not drawn")
         }
+        let milliseconds = (CACurrentMediaTime() - touchedAt) * 1000
+        curlLog.debug("turn \(run): first frame \(milliseconds, format: .fixed(precision: 1)) ms after the touch")
 
         // Weak captures only: the step waits until the animation ends, and a strong reference
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
@@ -175,7 +182,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// turn snapshots the spreads on the spot.
     public func prefetch() {
         // During a curl the main thread is busy with frames; release() restarts the rebuild.
-        guard overlay == nil else { return }
+        guard activeRun == nil else { return }
         // After the frame commits: rebuilding in the same run loop pass would stall the first
         // frames of the animation.
         afterFrameCommit { [weak self] in
@@ -202,16 +209,15 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func release() {
-        dropOverlay()
+        stopRun()
         holdContinuation?.resume()
         holdContinuation = nil
         prefetch()
     }
 
-    private func dropOverlay() {
+    private func stopRun() {
         overlay?.stop()
         overlay?.removeFromSuperview()
-        overlay = nil
         activeRun = nil
     }
 
@@ -250,7 +256,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func rebuildCache() {
-        guard overlay == nil, let host, let container else { return }
+        guard activeRun == nil, let host, let container else { return }
         let size = container.bounds.size
         guard size.width > 0, size.height > 0 else { return }
         fillCache(host: host, size: size, next: true, previous: true)

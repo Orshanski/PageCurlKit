@@ -9,8 +9,8 @@ Two API layers:
 - **Conductor** — `PageCurlController` + the `PageCurlHost` protocol: snapshot
   cache, quiet window, interruption, queueing — the whole mechanics of turning
   with a curl. The controller keeps one curl view for all turns: its textures
-  are allocated once and refilled, and on Apple GPUs the multisample and depth
-  buffers take no memory at all.
+  are refilled for each turn and made again only when the size changes, and on
+  Apple GPUs the multisample and depth buffers take no memory at all.
 - **Bare effect** — `PageCurlOverlayView`: two snapshots in, a self-driving
   animation to completion. For those who only need the render.
 
