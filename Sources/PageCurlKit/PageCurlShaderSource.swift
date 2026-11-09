@@ -113,7 +113,7 @@ vertex LeafVaryings leaf_vertex(
         clamp(pz * u.zScale + u.zEpsilon, 0.0, 0.999),
         1.0
     );
-    // The loader stores CGImage rows top-down: v=0 is the snapshot's top.
+    // Snapshot rows are stored top-down: v=0 is the snapshot's top.
     if (u.isSingle > 0.5) {
         // The leaf is the whole snapshot; the back samples the same point:
         // the flipped geometry itself yields the mirrored look.

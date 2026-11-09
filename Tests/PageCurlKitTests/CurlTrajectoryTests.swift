@@ -59,6 +59,38 @@ final class CurlTrajectoryTests: XCTestCase {
         XCTAssertGreaterThan(mid.shadowAmp, 0, "The shadow is visible midway")
     }
 
+    // MARK: - From a turn
+
+    private func turn(isSpread: Bool, forward: Bool) -> CurlTrajectory {
+        var configuration = PageCurlConfiguration()
+        configuration.spreadStartRadiusFraction = 0.2
+        configuration.singleStartRadiusFraction = 0.1
+        return CurlTrajectory(
+            sizePoints: CGSize(width: 800, height: 600), isSpread: isSpread, forward: forward,
+            paper: (1, 1, 1), configuration: configuration
+        )
+    }
+
+    func testOnlyASpreadTurnedBackIsMirrored() {
+        XCTAssertEqual(turn(isSpread: true, forward: true).direction, 1)
+        XCTAssertEqual(turn(isSpread: true, forward: false).direction, -1)
+        XCTAssertEqual(turn(isSpread: false, forward: true).direction, 1)
+        XCTAssertEqual(turn(isSpread: false, forward: false).direction, 1, "Single backward reverses time instead")
+    }
+
+    func testSheetAndRadiusFollowTheKindOfTurn() {
+        let spread = turn(isSpread: true, forward: true)
+        XCTAssertEqual(spread.sheetWidth, 400, "A spread's leaf is half the screen")
+        XCTAssertEqual(spread.curlStartRadius, 400 * 0.2, accuracy: 0.001, "Spread radius fraction")
+        let single = turn(isSpread: false, forward: true)
+        XCTAssertEqual(single.sheetWidth, 800, "A single leaf is the whole screen")
+        XCTAssertEqual(single.curlStartRadius, 800 * 0.1, accuracy: 0.001, "Single-page radius fraction")
+        for trajectory in [spread, single] {
+            XCTAssertEqual(trajectory.screenHalfWidth, 400)
+            XCTAssertEqual(trajectory.sheetHeight, 600)
+        }
+    }
+
     func testConfigurationDrivesGeometry() {
         let standard = spread()
         XCTAssertGreaterThan(spread(radiusFraction: 0.30).curlStartRadius, standard.curlStartRadius)

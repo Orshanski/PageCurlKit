@@ -28,7 +28,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// Set only after a confirmed show, so a tap at the edge of the book does not block the next turn.
     private var lastShownAt: CFTimeInterval = 0
 
-    // Test seams.
+    // Tests replace the clock and the wait for the frame commit.
     var now: () -> CFTimeInterval = { CACurrentMediaTime() }
     var afterFrameCommit: (@escaping @MainActor () -> Void) -> Void = { work in
         CATransaction.setCompletionBlock {
@@ -36,14 +36,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         }
     }
 
-    private struct SnapshotCache {
-        let position: Host.Position
-        let size: CGSize
-        let current: UIImage
-        var next: UIImage?
-        var previous: UIImage?
-    }
-    private var cache: SnapshotCache?
+    private var cache: SnapshotCache<Host.Position, UIImage>?
 
     private let sizeSentinel = ContainerSizeSentinel()
     private var backgroundWatcher: BackgroundWatcher?
@@ -116,7 +109,7 @@ public final class PageCurlController<Host: PageCurlHost> {
             return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent", isFailure: false)
         }
         guard let overlay = curlView() else {
-            return enqueueInstantShow(forward: forward, host: host, reason: "no curl view (no Metal)")
+            return enqueueInstantShow(forward: forward, host: host, reason: "no curl view")
         }
         guard size.width > 0, size.height > 0 else {
             return enqueueInstantShow(forward: forward, host: host, reason: "empty container")
@@ -153,14 +146,8 @@ public final class PageCurlController<Host: PageCurlHost> {
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
-            let from = host.currentPosition
-            let shown = await host.showTarget(forward: forward)
-            if shown {
-                if let self {
-                    self.lastShownAt = self.now()
-                    self.shiftCache(forward: forward, from: from, to: host.currentPosition)
-                }
-            } else {
+            let shown = await Self.show(forward: forward, host: host, controller: self)
+            if !shown {
                 // The host provided a neighbour view but then could not show it: an integration bug.
                 assertionFailure("showTarget did not show the spread the host provided a view for")
                 if let self, self.activeRun == run {
@@ -234,64 +221,60 @@ public final class PageCurlController<Host: PageCurlHost> {
         }
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
-            let from = host.currentPosition
-            let shown = await host.showTarget(forward: forward)
-            if shown, let self {
-                self.lastShownAt = self.now()
-                self.shiftCache(forward: forward, from: from, to: host.currentPosition)
-            }
+            _ = await Self.show(forward: forward, host: host, controller: self)
         }
     }
 
-    /// After a one-step turn the target snapshot becomes current and the old current becomes the
-    /// neighbour behind, so only the new neighbour ahead is snapshotted.
-    private func shiftCache(forward: Bool, from: Host.Position, to: Host.Position) {
-        guard from != to, let old = cache, old.position == from,
-              let target = forward ? old.next : old.previous
-        else { return }
-        cache = SnapshotCache(
-            position: to, size: old.size, current: target,
-            next: forward ? nil : old.current,
-            previous: forward ? old.current : nil
-        )
+    /// Shows the target; after a show starts the quiet window and moves the cache along. The show
+    /// happens even if the controller is gone.
+    private static func show(
+        forward: Bool, host: Host, controller: PageCurlController?
+    ) async -> Bool {
+        let from = host.currentPosition
+        let shown = await host.showTarget(forward: forward)
+        if shown, let controller {
+            controller.lastShownAt = controller.now()
+            if let shifted = controller.cache?.shifted(
+                forward: forward, from: from, to: host.currentPosition
+            ) {
+                controller.cache = shifted
+            }
+        }
+        return shown
     }
 
     private func snapshotPair(
         forward: Bool, host: Host, size: CGSize
     ) -> (current: UIImage, target: UIImage)? {
-        fillCache(host: host, size: size, next: forward, previous: !forward)
-        guard let cache, let target = forward ? cache.next : cache.previous else { return nil }
-        return (cache.current, target)
+        fillCache(host: host, size: size, directions: [forward])
+        return cache?.pair(forward: forward)
     }
 
     private func rebuildCache() {
         guard activeRun == nil, let host, let container else { return }
         let size = container.bounds.size
         guard size.width > 0, size.height > 0 else { return }
-        fillCache(host: host, size: size, next: true, previous: true)
+        fillCache(host: host, size: size, directions: [true, false])
     }
 
-    /// A missing neighbour is not cached as missing: it is requested again next time.
-    private func fillCache(host: Host, size: CGSize, next: Bool, previous: Bool) {
+    /// Snapshots what the cache lacks: the spread on screen if the cache is for another position or
+    /// size, and the missing neighbours in `directions` (true — ahead).
+    private func fillCache(host: Host, size: CGSize, directions: [Bool]) {
         let position = host.currentPosition
-        if cache?.position != position || cache?.size != size {
+        if cache?.isValid(for: position, size: size) != true {
             guard let view = host.currentSpreadView() else {
                 cache = nil
                 return
             }
             cache = SnapshotCache(
                 position: position, size: size,
-                current: snapshot(of: view, size: size, paper: host.paperColor),
-                next: nil, previous: nil
+                current: snapshot(of: view, size: size, paper: host.paperColor)
             )
         }
-        if next, cache?.next == nil {
-            cache?.next = host.neighbourSpreadView(forward: true)
+        for forward in directions where cache?.neighbour(forward: forward) == nil {
+            let image = host.neighbourSpreadView(forward: forward)
                 .map { snapshot(of: $0, size: size, paper: host.paperColor) }
-        }
-        if previous, cache?.previous == nil {
-            cache?.previous = host.neighbourSpreadView(forward: false)
-                .map { snapshot(of: $0, size: size, paper: host.paperColor) }
+            cache?.setNeighbour(image, forward: forward)
         }
     }
 
@@ -299,10 +282,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     private func snapshot(of view: UIView, size: CGSize, paper: UIColor) -> UIImage {
         assert(view.bounds.size == size, "The host spread view must match the container size")
         view.layoutIfNeeded()
-        // 8 bits per channel, what the render expects; a wide-color display would otherwise give 16.
-        let format = UIGraphicsImageRendererFormat.preferred()
-        format.preferredRange = .standard
-        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+        return UIGraphicsImageRenderer(size: size, format: SnapshotRaster.rendererFormat()).image { context in
             paper.setFill()
             context.fill(CGRect(origin: .zero, size: size))
             view.layer.render(in: context.cgContext)
