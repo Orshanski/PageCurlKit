@@ -13,7 +13,7 @@ final class SnapshotRasterTests: XCTestCase {
             bitsPerComponent: bitsPerComponent, bytesPerRow: 0, space: space,
             bitmapInfo: bitmapInfo
         ))
-        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return try XCTUnwrap(context.makeImage())
     }
