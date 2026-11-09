@@ -64,3 +64,33 @@ struct CurlTrajectory {
         return u
     }
 }
+
+extension CurlTrajectory {
+    /// Only a spread turned backward curls mirrored: its leaf moves right, away from the spine.
+    static func direction(isSpread: Bool, forward: Bool) -> Float {
+        (isSpread && !forward) ? -1 : 1
+    }
+
+    /// The trajectory of one turn on a container of `sizePoints`.
+    init(
+        sizePoints: CGSize, isSpread: Bool, forward: Bool,
+        paper: (r: Float, g: Float, b: Float), configuration: PageCurlConfiguration
+    ) {
+        self.init(
+            sheetWidth: isSpread ? Float(sizePoints.width / 2) : Float(sizePoints.width),
+            sheetHeight: Float(sizePoints.height),
+            screenHalfWidth: Float(sizePoints.width / 2),
+            isSpread: isSpread,
+            direction: Self.direction(isSpread: isSpread, forward: forward),
+            paper: paper,
+            startRadiusFraction: Float(
+                isSpread
+                    ? configuration.spreadStartRadiusFraction
+                    : configuration.singleStartRadiusFraction
+            ),
+            coneStrength: Float(configuration.coneStrength),
+            shadowStrength: Float(configuration.shadowStrength),
+            backMirrorOpacity: Float(configuration.backMirrorOpacity)
+        )
+    }
+}

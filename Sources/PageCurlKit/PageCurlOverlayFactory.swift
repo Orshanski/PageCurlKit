@@ -11,8 +11,7 @@ struct PageCurlOverlayRequest {
     let configuration: PageCurlConfiguration
 }
 
-/// The curl view as the controller uses it: one view, loaded and run again for every turn. Tests
-/// substitute a lightweight one without Metal and finish the animation themselves.
+/// The curl view as the controller uses it: one view, loaded and run again for every turn.
 @MainActor
 protocol PageCurlOverlayAnimating: UIView {
     var onFinished: (() -> Void)? { get set }
@@ -35,7 +34,10 @@ protocol PageCurlOverlayFactory {
 @MainActor
 struct MetalOverlayFactory: PageCurlOverlayFactory {
     func makeOverlay() -> PageCurlOverlayAnimating? {
-        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            curlLog.error("curl view not made: no Metal device")
+            return nil
+        }
         return PageCurlOverlayView(device: device)
     }
 }

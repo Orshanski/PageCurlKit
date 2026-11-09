@@ -17,9 +17,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     private let leafPipeline: MTLRenderPipelineState
     private let backgroundPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
-    private let leftQuadBuffer: MTLBuffer
-    private let rightQuadBuffer: MTLBuffer
-    private let fullQuadBuffer: MTLBuffer
+    private let quadBuffers: [BackgroundQuad: MTLBuffer]
     private let renderTargetStorage: MTLStorageMode
 
     // Refilled by `prepare` for every turn; allocated again only when the size changes.
@@ -31,9 +29,8 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     private var depthTexture: MTLTexture?
 
     private var trajectory: CurlTrajectory?
+    private var scene: CurlScene?
     private var duration: CFTimeInterval = 0
-    private var isSpread = false
-    private var forward = true
     private var framesPerSecond = 0
     private var startTime: CFTimeInterval = 0
     private var finished = true
@@ -52,7 +49,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
 
     // The pipelines and the render targets must agree on these, otherwise Metal rejects the pass.
     private static let msaaSampleCount = 4
-    private static let colorFormat: MTLPixelFormat = .bgra8Unorm
+    private static let colorFormat = SnapshotRaster.pixelFormat
     private static let depthFormat: MTLPixelFormat = .depth32Float
 
     /// Built once per device: compiling shaders on every curl drops the first frames.
@@ -65,43 +62,60 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     )?
 
     public static func warmUp(device: MTLDevice) {
-        _ = Self.pipelines(device: device)
+        _ = try? Self.pipelines(device: device)
     }
 
-    private static func pipelines(device: MTLDevice) -> (
+    /// Why the curl view could not be set up.
+    struct SetupFailure: Error {
+        let reason: String
+    }
+
+    private static func pipelines(device: MTLDevice) throws(SetupFailure) -> (
         queue: MTLCommandQueue,
         leaf: MTLRenderPipelineState,
         background: MTLRenderPipelineState,
         depth: MTLDepthStencilState
-    )? {
+    ) {
         if let cached = pipelineCache, cached.deviceID == ObjectIdentifier(device) {
             return (cached.queue, cached.leaf, cached.background, cached.depth)
         }
-        guard let queue = device.makeCommandQueue(),
-              let library = try? device.makeLibrary(source: pageCurlShaderSource, options: nil),
-              let leafVertex = library.makeFunction(name: "leaf_vertex"),
-              let leafFragment = library.makeFunction(name: "leaf_fragment"),
-              let bgVertex = library.makeFunction(name: "background_vertex"),
-              let bgFragment = library.makeFunction(name: "background_fragment")
-        else { return nil }
-
-        func pipeline(_ vertex: MTLFunction, _ fragment: MTLFunction) -> MTLRenderPipelineState? {
+        guard let queue = device.makeCommandQueue() else {
+            throw SetupFailure(reason: "no command queue")
+        }
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: pageCurlShaderSource, options: nil)
+        } catch {
+            throw SetupFailure(reason: "shaders did not compile: \(error.localizedDescription)")
+        }
+        func function(_ name: String) throws(SetupFailure) -> MTLFunction {
+            guard let function = library.makeFunction(name: name) else {
+                throw SetupFailure(reason: "no shader function \(name)")
+            }
+            return function
+        }
+        func pipeline(_ vertex: String, _ fragment: String) throws(SetupFailure) -> MTLRenderPipelineState {
             let descriptor = MTLRenderPipelineDescriptor()
-            descriptor.vertexFunction = vertex
-            descriptor.fragmentFunction = fragment
+            descriptor.vertexFunction = try function(vertex)
+            descriptor.fragmentFunction = try function(fragment)
             // Not an sRGB format, so snapshot pixels are written as is, without re-encoding.
             descriptor.colorAttachments[0].pixelFormat = colorFormat
             descriptor.depthAttachmentPixelFormat = depthFormat
             descriptor.rasterSampleCount = msaaSampleCount
-            return try? device.makeRenderPipelineState(descriptor: descriptor)
+            do {
+                return try device.makeRenderPipelineState(descriptor: descriptor)
+            } catch {
+                throw SetupFailure(reason: "pipeline \(vertex) not built: \(error.localizedDescription)")
+            }
         }
+        let leaf = try pipeline("leaf_vertex", "leaf_fragment")
+        let background = try pipeline("background_vertex", "background_fragment")
         let depthDescriptor = MTLDepthStencilDescriptor()
         depthDescriptor.depthCompareFunction = .greaterEqual
         depthDescriptor.isDepthWriteEnabled = true
-        guard let leaf = pipeline(leafVertex, leafFragment),
-              let background = pipeline(bgVertex, bgFragment),
-              let depth = device.makeDepthStencilState(descriptor: depthDescriptor)
-        else { return nil }
+        guard let depth = device.makeDepthStencilState(descriptor: depthDescriptor) else {
+            throw SetupFailure(reason: "no depth state")
+        }
         pipelineCache = (ObjectIdentifier(device), queue, leaf, background, depth)
         return (queue, leaf, background, depth)
     }
@@ -118,32 +132,35 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
 
     /// An empty view for repeated turns: `prepare` loads each turn, `startIfFirstFrameDrawn` runs it.
     init?(device: MTLDevice) {
-        guard let shared = Self.pipelines(device: device) else { return nil }
+        let shared: (
+            queue: MTLCommandQueue,
+            leaf: MTLRenderPipelineState,
+            background: MTLRenderPipelineState,
+            depth: MTLDepthStencilState
+        )
+        do {
+            shared = try Self.pipelines(device: device)
+        } catch {
+            curlLog.error("curl view not made: \(error.reason, privacy: .public)")
+            return nil
+        }
         commandQueue = shared.queue
         leafPipeline = shared.leaf
         backgroundPipeline = shared.background
         depthState = shared.depth
 
-        // Background quads in NDC as (x, y, u, v); v=0 is the top of the snapshot.
-        func quad(x0: Float, x1: Float, u0: Float, u1: Float) -> [Float] {
-            [
-                x0, -1, u0, 1, x0, 1, u0, 0, x1, -1, u1, 1,
-                x1, -1, u1, 1, x0, 1, u0, 0, x1, 1, u1, 0,
-            ]
+        var quadBuffers: [BackgroundQuad: MTLBuffer] = [:]
+        for quad in BackgroundQuad.allCases {
+            let vertices = quad.vertices
+            guard let buffer = device.makeBuffer(
+                bytes: vertices, length: vertices.count * MemoryLayout<Float>.size
+            ) else {
+                curlLog.error("curl view not made: no buffer for the background")
+                return nil
+            }
+            quadBuffers[quad] = buffer
         }
-        let leftQuad = quad(x0: -1, x1: 0, u0: 0, u1: 0.5)
-        let rightQuad = quad(x0: 0, x1: 1, u0: 0.5, u1: 1)
-        let fullQuad = quad(x0: -1, x1: 1, u0: 0, u1: 1)
-        guard let leftBuffer = device.makeBuffer(
-            bytes: leftQuad, length: leftQuad.count * MemoryLayout<Float>.size
-        ), let rightBuffer = device.makeBuffer(
-            bytes: rightQuad, length: rightQuad.count * MemoryLayout<Float>.size
-        ), let fullBuffer = device.makeBuffer(
-            bytes: fullQuad, length: fullQuad.count * MemoryLayout<Float>.size
-        ) else { return nil }
-        leftQuadBuffer = leftBuffer
-        rightQuadBuffer = rightBuffer
-        fullQuadBuffer = fullBuffer
+        self.quadBuffers = quadBuffers
         renderTargetStorage = Self.renderTargetStorage(device: device)
 
         super.init(frame: .zero, device: device)
@@ -186,21 +203,18 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     /// Loads one turn into the view, reusing the textures and the mesh when the size is unchanged.
     func prepare(_ request: PageCurlOverlayRequest) -> Bool {
         let sizePoints = request.sizePoints
-        let isSpread = request.isSpread
-        let forward = request.forward
         let configuration = request.configuration
         guard let device, sizePoints.width > 0, sizePoints.height > 0 else { return false }
         lastCommandBuffer?.waitUntilCompleted()
         lastCommandBuffer = nil
 
-        guard let current = Self.loadSnapshot(
-                  request.currentSpread, reusing: currentTexture, device: device
-              ),
-              let target = Self.loadSnapshot(
-                  request.targetSpread, reusing: targetTexture, device: device
-              )
-        else {
-            curlLog.error("overlay not prepared: a snapshot did not load into a texture")
+        let current: MTLTexture
+        let target: MTLTexture
+        do {
+            current = try Self.loadSnapshot(request.currentSpread, reusing: currentTexture, device: device)
+            target = try Self.loadSnapshot(request.targetSpread, reusing: targetTexture, device: device)
+        } catch {
+            curlLog.error("overlay not prepared: \(error.rawValue, privacy: .public)")
             return false
         }
         currentTexture = current
@@ -209,20 +223,8 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         var red: CGFloat = 1, green: CGFloat = 1, blue: CGFloat = 1, alpha: CGFloat = 1
         request.paperColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         let trajectory = CurlTrajectory(
-            sheetWidth: isSpread ? Float(sizePoints.width / 2) : Float(sizePoints.width),
-            sheetHeight: Float(sizePoints.height),
-            screenHalfWidth: Float(sizePoints.width / 2),
-            isSpread: isSpread,
-            direction: (isSpread && !forward) ? -1 : 1,
-            paper: (Float(red), Float(green), Float(blue)),
-            startRadiusFraction: Float(
-                isSpread
-                    ? configuration.spreadStartRadiusFraction
-                    : configuration.singleStartRadiusFraction
-            ),
-            coneStrength: Float(configuration.coneStrength),
-            shadowStrength: Float(configuration.shadowStrength),
-            backMirrorOpacity: Float(configuration.backMirrorOpacity)
+            sizePoints: sizePoints, isSpread: request.isSpread, forward: request.forward,
+            paper: (Float(red), Float(green), Float(blue)), configuration: configuration
         )
         if leafMesh?.width != trajectory.sheetWidth || leafMesh?.height != trajectory.sheetHeight {
             leafMesh = nil
@@ -236,8 +238,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         }
 
         self.trajectory = trajectory
-        self.forward = forward
-        self.isSpread = isSpread
+        scene = CurlScene(isSpread: request.isSpread, forward: request.forward)
         duration = configuration.duration
         framesPerSecond = configuration.preferredFramesPerSecond
         frame = CGRect(origin: .zero, size: sizePoints)
@@ -245,31 +246,10 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         return true
     }
 
-    /// About 5 pt between columns, across the fold where the sheet bends; rows can be coarse.
     private static func makeLeafMesh(device: MTLDevice, width: Float, height: Float) -> LeafMesh? {
-        let columns = max(2, Int(width / 5))
-        let rows = 24
-        var vertices: [Float] = []
-        vertices.reserveCapacity((columns + 1) * (rows + 1) * 4)
-        for row in 0...rows {
-            let v = Float(row) / Float(rows)
-            for column in 0...columns {
-                let u = Float(column) / Float(columns)
-                vertices.append(contentsOf: [u * width, v * height, u, v])
-            }
-        }
-        var indices: [UInt32] = []
-        indices.reserveCapacity(columns * rows * 6)
-        let stride = UInt32(columns + 1)
-        for row in 0..<UInt32(rows) {
-            for column in 0..<UInt32(columns) {
-                let a = row * stride + column
-                let b = a + 1
-                let c = a + stride
-                let d = c + 1
-                indices.append(contentsOf: [a, c, b, b, c, d])
-            }
-        }
+        let geometry = LeafMeshGeometry(width: width, height: height)
+        let vertices = geometry.vertices
+        let indices = geometry.indices
         guard let vertexBuffer = device.makeBuffer(
             bytes: vertices, length: vertices.count * MemoryLayout<Float>.size
         ), let indexBuffer = device.makeBuffer(
@@ -282,61 +262,35 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     }
 
     /// Writes the snapshot's pixels into `reusing` when it has the same size, otherwise into a new
-    /// texture. The bytes are copied as is: 8-bit BGRA, no sRGB re-encoding.
-    static func loadSnapshot(_ image: UIImage, reusing: MTLTexture?, device: MTLDevice) -> MTLTexture? {
-        guard let source = image.cgImage,
-              let raster = isPipelineRaster(source) ? source : normalizedRaster(source),
-              let data = raster.dataProvider?.data,
-              CFDataGetLength(data) >= raster.bytesPerRow * raster.height,
-              let bytes = CFDataGetBytePtr(data)
-        else { return nil }
+    /// texture.
+    static func loadSnapshot(
+        _ image: UIImage, reusing: MTLTexture?, device: MTLDevice
+    ) throws(SnapshotLoadFailure) -> MTLTexture {
+        let raster = try SnapshotRaster(image)
         let texture: MTLTexture
         if let reusing, reusing.width == raster.width, reusing.height == raster.height {
             texture = reusing
         } else {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: colorFormat, width: raster.width, height: raster.height,
+                pixelFormat: SnapshotRaster.pixelFormat, width: raster.width, height: raster.height,
                 mipmapped: false
             )
             descriptor.usage = .shaderRead
             descriptor.storageMode = .shared
-            guard let made = device.makeTexture(descriptor: descriptor) else { return nil }
+            guard let made = device.makeTexture(descriptor: descriptor) else {
+                throw .textureNotAllocated
+            }
             texture = made
         }
-        texture.replace(
-            region: MTLRegionMake2D(0, 0, raster.width, raster.height),
-            mipmapLevel: 0,
-            withBytes: bytes,
-            bytesPerRow: raster.bytesPerRow
-        )
+        raster.bytes.withUnsafeBytes { bytes in
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, raster.width, raster.height),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: raster.bytesPerRow
+            )
+        }
         return texture
-    }
-
-    /// Whether the bytes already are what the pipeline reads: 8-bit BGRA with alpha first.
-    nonisolated static func isPipelineRaster(_ cgImage: CGImage) -> Bool {
-        let alpha = cgImage.alphaInfo
-        return cgImage.bitsPerComponent == 8
-            && cgImage.bitsPerPixel == 32
-            && cgImage.byteOrderInfo == .order32Little
-            && (alpha == .premultipliedFirst || alpha == .noneSkipFirst)
-    }
-
-    /// Redraw into the pipeline's raster: 8-bit BGRA, sRGB.
-    nonisolated static func normalizedRaster(_ cgImage: CGImage) -> CGImage? {
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                  data: nil,
-                  width: cgImage.width,
-                  height: cgImage.height,
-                  bitsPerComponent: 8,
-                  bytesPerRow: 0,
-                  space: space,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                      | CGBitmapInfo.byteOrder32Little.rawValue
-              )
-        else { return nil }
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-        return context.makeImage()
     }
 
     /// Starts the animation. If the first frame cannot be drawn, nothing runs and `onFinished` is
@@ -350,7 +304,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     /// Draws the first frame and starts the animation; false — the first frame did not reach the
     /// screen and the animation did not start.
     func startIfFirstFrameDrawn() -> Bool {
-        guard trajectory != nil else {
+        guard scene != nil else {
             curlLog.error("first frame not drawn: nothing prepared")
             return false
         }
@@ -447,7 +401,7 @@ extension PageCurlOverlayView: MTKViewDelegate {
 
     /// Encodes and presents one frame; returns why it was not drawn, or nil.
     private func renderFrame(progress: Float) -> String? {
-        guard let trajectory, let currentTexture, let targetTexture, let leafMesh else {
+        guard let trajectory, let scene, let currentTexture, let targetTexture, let leafMesh else {
             return "nothing prepared"
         }
         guard let drawable = currentDrawable else { return "no drawable" }
@@ -470,43 +424,31 @@ extension PageCurlOverlayView: MTKViewDelegate {
             return "no render encoder"
         }
 
-        // Single-page backward: the forward trajectory with time reversed.
-        let trajectoryProgress = (isSpread || forward) ? progress : 1 - progress
+        func texture(_ snapshot: CurlSnapshot) -> MTLTexture {
+            snapshot == .current ? currentTexture : targetTexture
+        }
 
         encoder.setDepthStencilState(depthState)
         encoder.setCullMode(.none)
-        // The flat mesh is wound counter-clockwise; the mirrored direction flips the winding.
         // Without this the leaf shows its back at t=0.
-        encoder.setFrontFacing(trajectory.direction > 0 ? .counterClockwise : .clockwise)
+        encoder.setFrontFacing(scene.frontFacesCounterClockwise ? .counterClockwise : .clockwise)
 
-        var uniforms = trajectory.uniforms(atProgress: trajectoryProgress)
+        var uniforms = trajectory.uniforms(atProgress: scene.trajectoryProgress(progress))
 
-        // Spread: the half that stays comes from the current snapshot, the half being revealed from
-        // the target. Single page: the page underneath is the target going forward and the current
-        // page going backward.
         encoder.setRenderPipelineState(backgroundPipeline)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CurlUniforms>.size, index: 1)
-        if isSpread {
-            encoder.setVertexBuffer(leftQuadBuffer, offset: 0, index: 0)
-            encoder.setFragmentTexture(forward ? currentTexture : targetTexture, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            encoder.setVertexBuffer(rightQuadBuffer, offset: 0, index: 0)
-            encoder.setFragmentTexture(forward ? targetTexture : currentTexture, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        } else {
-            encoder.setVertexBuffer(fullQuadBuffer, offset: 0, index: 0)
-            encoder.setFragmentTexture(forward ? targetTexture : currentTexture, index: 0)
+        for background in scene.backgrounds {
+            encoder.setVertexBuffer(quadBuffers[background.quad], offset: 0, index: 0)
+            encoder.setFragmentTexture(texture(background.snapshot), index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
 
-        // Single page backward: the target page curls back in, so it is the leaf.
-        let leafTexture = (isSpread || forward) ? currentTexture : targetTexture
         encoder.setRenderPipelineState(leafPipeline)
         encoder.setVertexBuffer(leafMesh.vertices, offset: 0, index: 0)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<CurlUniforms>.size, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CurlUniforms>.size, index: 1)
-        encoder.setFragmentTexture(leafTexture, index: 0)
-        encoder.setFragmentTexture(targetTexture, index: 1)
+        encoder.setFragmentTexture(texture(scene.leafFace), index: 0)
+        encoder.setFragmentTexture(texture(scene.leafBack), index: 1)
         encoder.drawIndexedPrimitives(
             type: .triangle,
             indexCount: leafMesh.indexCount,
