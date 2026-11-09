@@ -146,7 +146,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
-            let shown = await Self.show(forward: forward, host: host, controller: self)
+            let shown = await Self.show(forward: forward, host: host) { [weak self] in self }
             if !shown {
                 // The host provided a neighbour view but then could not show it: an integration bug.
                 assertionFailure("showTarget did not show the spread the host provided a view for")
@@ -221,18 +221,19 @@ public final class PageCurlController<Host: PageCurlHost> {
         }
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
-            _ = await Self.show(forward: forward, host: host, controller: self)
+            _ = await Self.show(forward: forward, host: host) { [weak self] in self }
         }
     }
 
     /// Shows the target; after a show starts the quiet window and moves the cache along. The show
-    /// happens even if the controller is gone.
+    /// happens even if the controller is gone: it is looked up only after the show, so the wait does
+    /// not keep it alive.
     private static func show(
-        forward: Bool, host: Host, controller: PageCurlController?
+        forward: Bool, host: Host, controller: () -> PageCurlController?
     ) async -> Bool {
         let from = host.currentPosition
         let shown = await host.showTarget(forward: forward)
-        if shown, let controller {
+        if shown, let controller = controller() {
             controller.lastShownAt = controller.now()
             if let shifted = controller.cache?.shifted(
                 forward: forward, from: from, to: host.currentPosition

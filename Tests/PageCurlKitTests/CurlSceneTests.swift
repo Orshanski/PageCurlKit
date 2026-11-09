@@ -56,6 +56,13 @@ final class CurlSceneTests: XCTestCase {
             } else {
                 XCTAssertEqual(start, 0)
                 XCTAssertEqual(scene.leafFace, .current, "Flat leaf at the start shows the current spread")
+                // The flat leaf lies right of its axis, or left when mirrored; on a spread the
+                // other half is background and must be the current spread too.
+                guard isSpread else { continue }
+                let leafHalf: BackgroundQuad =
+                    CurlTrajectory.direction(isSpread: isSpread, forward: forward) > 0 ? .right : .left
+                let visible = scene.backgrounds.filter { $0.quad != leafHalf }
+                XCTAssertEqual(visible.map(\.snapshot), [.current], "forward \(forward): the half beside the leaf")
             }
         }
     }
