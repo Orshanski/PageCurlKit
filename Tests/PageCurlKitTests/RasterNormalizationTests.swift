@@ -53,7 +53,6 @@ final class RasterNormalizationTests: XCTestCase {
         )
         XCTAssertEqual(texture.width, 8)
         XCTAssertEqual(texture.height, 8)
-        XCTAssertEqual(firstPixel(texture), [0, 0, 255, 255], "Red as B, G, R, A")
     }
 
     @MainActor

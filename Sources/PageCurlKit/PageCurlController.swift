@@ -110,10 +110,10 @@ public final class PageCurlController<Host: PageCurlHost> {
         // queue as "not busy".
         let size = container.bounds.size
         guard host.canTurn() else {
-            return enqueueInstantShow(forward: forward, host: host, reason: "host is busy")
+            return enqueueInstantShow(forward: forward, host: host, reason: "host is busy", isFailure: false)
         }
         guard now() - lastShownAt > configuration.duration else {
-            return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent")
+            return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent", isFailure: false)
         }
         guard let overlay = curlView() else {
             return enqueueInstantShow(forward: forward, host: host, reason: "no curl view (no Metal)")
@@ -147,7 +147,7 @@ public final class PageCurlController<Host: PageCurlHost> {
             return enqueueInstantShow(forward: forward, host: host, reason: "first frame not drawn")
         }
         let milliseconds = (CACurrentMediaTime() - touchedAt) * 1000
-        curlLog.debug("turn \(run): first frame \(milliseconds, format: .fixed(precision: 1)) ms after the touch")
+        curlLog.notice("turn \(run): first frame \(milliseconds, format: .fixed(precision: 1)) ms after the touch")
 
         // Weak captures only: the step waits until the animation ends, and a strong reference
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
@@ -164,7 +164,7 @@ public final class PageCurlController<Host: PageCurlHost> {
                 // The host provided a neighbour view but then could not show it: an integration bug.
                 assertionFailure("showTarget did not show the spread the host provided a view for")
                 if let self, self.activeRun == run {
-                    self.interrupt(reason: "showTarget showed nothing")
+                    self.interrupt(reason: "showTarget showed nothing", isFailure: true)
                 }
                 return
             }
@@ -202,9 +202,13 @@ public final class PageCurlController<Host: PageCurlHost> {
         interrupt(reason: "host interrupted")
     }
 
-    private func interrupt(reason: String) {
+    private func interrupt(reason: String, isFailure: Bool = false) {
         guard let activeRun else { return }
-        curlLog.debug("turn \(activeRun) interrupted: \(reason, privacy: .public)")
+        if isFailure {
+            curlLog.error("turn \(activeRun) interrupted: \(reason, privacy: .public)")
+        } else {
+            curlLog.debug("turn \(activeRun) interrupted: \(reason, privacy: .public)")
+        }
         release()
     }
 
@@ -221,8 +225,13 @@ public final class PageCurlController<Host: PageCurlHost> {
         activeRun = nil
     }
 
-    private func enqueueInstantShow(forward: Bool, host: Host, reason: String) {
-        curlLog.debug("instant show: \(reason, privacy: .public)")
+    /// `isFailure` false — an expected fallback (busy host, rapid tapping), logged at debug level.
+    private func enqueueInstantShow(forward: Bool, host: Host, reason: String, isFailure: Bool = true) {
+        if isFailure {
+            curlLog.error("instant show: \(reason, privacy: .public)")
+        } else {
+            curlLog.debug("instant show: \(reason, privacy: .public)")
+        }
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
             let from = host.currentPosition

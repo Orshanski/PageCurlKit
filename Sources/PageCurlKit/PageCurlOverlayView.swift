@@ -200,7 +200,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
                   request.targetSpread, reusing: targetTexture, device: device
               )
         else {
-            curlLog.debug("overlay not prepared: a snapshot did not load into a texture")
+            curlLog.error("overlay not prepared: a snapshot did not load into a texture")
             return false
         }
         currentTexture = current
@@ -229,7 +229,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
             guard let mesh = Self.makeLeafMesh(
                 device: device, width: trajectory.sheetWidth, height: trajectory.sheetHeight
             ) else {
-                curlLog.debug("overlay not prepared: the leaf mesh was not allocated")
+                curlLog.error("overlay not prepared: the leaf mesh was not allocated")
                 return false
             }
             leafMesh = mesh
@@ -351,7 +351,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     /// screen and the animation did not start.
     func startIfFirstFrameDrawn() -> Bool {
         guard trajectory != nil else {
-            curlLog.debug("first frame not drawn: nothing prepared")
+            curlLog.error("first frame not drawn: nothing prepared")
             return false
         }
         finished = false
@@ -367,7 +367,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         if let frameFailure {
             finished = true
             isPaused = true
-            curlLog.debug("first frame not drawn: \(frameFailure, privacy: .public)")
+            curlLog.error("first frame not drawn: \(frameFailure, privacy: .public)")
             return false
         }
         guard !finished else { return true }
@@ -407,7 +407,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         else { return nil }
         multisampleTexture = color
         depthTexture = depth
-        curlLog.debug(
+        curlLog.notice(
             "render targets \(width)x\(height), memoryless: \(self.renderTargetStorage == .memoryless)"
         )
         return (color, depth)
