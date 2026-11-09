@@ -8,7 +8,9 @@ Two API layers:
 
 - **Conductor** — `PageCurlController` + the `PageCurlHost` protocol: snapshot
   cache, quiet window, interruption, queueing — the whole mechanics of turning
-  with a curl.
+  with a curl. The controller keeps one curl view for all turns: its textures
+  are refilled for each turn and made again only when the size changes, and on
+  Apple GPUs the multisample and depth buffers take no memory at all.
 - **Bare effect** — `PageCurlOverlayView`: two snapshots in, a self-driving
   animation to completion. For those who only need the render.
 
@@ -209,6 +211,8 @@ overlay.start()
 
 // Show the target underneath right after start(): the overlay covers the
 // swap, and removing the overlay at any moment is then always safe.
+// If the first frame cannot be drawn, start() runs nothing and calls
+// onFinished at once, so the target simply appears instantly.
 // Here the snapshots are yours: fill their background with the paper color,
 // since transparent pixels turn black in the opaque render.
 ```

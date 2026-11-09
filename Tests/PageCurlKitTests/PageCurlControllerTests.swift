@@ -65,14 +65,38 @@ private final class FakeHost: PageCurlHost {
     }
 }
 
-/// No Metal; the test finishes the animation itself.
+/// No Metal; one view for all turns, like the real one. The test finishes the animation itself.
 @MainActor
 private final class FakeOverlay: UIView, PageCurlOverlayAnimating {
     var onFinished: (() -> Void)?
-    private(set) var started = false
+    var failNextPrepare = false
+    var failFirstFrame = false
+    private(set) var requests: [PageCurlOverlayRequest] = []
+    /// Started animations, that is turns that went the animated way.
+    private(set) var runs = 0
+    private(set) var textureReleases = 0
 
-    func start() {
-        started = true
+    func prepare(_ request: PageCurlOverlayRequest) -> Bool {
+        if failNextPrepare {
+            failNextPrepare = false
+            return false
+        }
+        requests.append(request)
+        return true
+    }
+
+    func startIfFirstFrameDrawn() -> Bool {
+        guard !failFirstFrame else { return false }
+        runs += 1
+        return true
+    }
+
+    func stop() {
+        onFinished = nil
+    }
+
+    func releaseTextures() {
+        textureReleases += 1
     }
 
     func finish() {
@@ -83,24 +107,12 @@ private final class FakeOverlay: UIView, PageCurlOverlayAnimating {
 @MainActor
 private final class FakeFactory: PageCurlOverlayFactory {
     var isAvailable = true
-    var failNextMake = false
-    private(set) var made: [FakeOverlay] = []
-    private(set) var requests: [PageCurlOverlayRequest] = []
-    private(set) var warmUpCalls = 0
+    let overlay = FakeOverlay()
+    private(set) var makeCalls = 0
 
-    func warmUp() {
-        warmUpCalls += 1
-    }
-
-    func makeOverlay(_ request: PageCurlOverlayRequest) -> PageCurlOverlayAnimating? {
-        if failNextMake {
-            failNextMake = false
-            return nil
-        }
-        requests.append(request)
-        let overlay = FakeOverlay()
-        made.append(overlay)
-        return overlay
+    func makeOverlay() -> PageCurlOverlayAnimating? {
+        makeCalls += 1
+        return isAvailable ? overlay : nil
     }
 }
 
@@ -112,6 +124,7 @@ final class PageCurlControllerTests: XCTestCase {
     private var factory: FakeFactory!
     private var container: UIView!
     private var controller: PageCurlController<FakeHost>!
+    private var overlay: FakeOverlay { factory.overlay }
     /// Advancing this clock ends the minimum interval between turns without waiting.
     private var time: CFTimeInterval = 1000
 
@@ -150,14 +163,14 @@ final class PageCurlControllerTests: XCTestCase {
     }
 
     private func completeBeautifulTurn(forward: Bool = true) async {
-        let overlaysBefore = factory.made.count
+        let overlaysBefore = overlay.runs
         let showsBefore = host.showTargetCalls.count
         controller.turn(forward: forward, isSpread: false)
-        XCTAssertEqual(factory.made.count, overlaysBefore + 1, "Expected the beautiful path")
+        XCTAssertEqual(overlay.runs, overlaysBefore + 1, "Expected the beautiful path")
         await waitUntil("show under the overlay") {
             host.showTargetCalls.count == showsBefore + 1
         }
-        factory.made.last?.finish()
+        overlay.finish()
         await host.drain()
     }
 
@@ -166,7 +179,7 @@ final class PageCurlControllerTests: XCTestCase {
     func testBusyHostShowsInstantly() async {
         host.canTurnOverride = false
         controller.turn(forward: true, isSpread: false)
-        XCTAssertTrue(factory.made.isEmpty, "A busy host means no overlay")
+        XCTAssertTrue(overlay.runs == 0, "A busy host means no overlay")
         await waitUntil("instant show") { host.showTargetCalls == [true] }
         await host.drain()
     }
@@ -174,29 +187,29 @@ final class PageCurlControllerTests: XCTestCase {
     func testUnexpiredQuietWindowShowsInstantly() async {
         await completeBeautifulTurn()
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(factory.made.count, 1, "No second overlay within the quiet window")
+        XCTAssertEqual(overlay.runs, 1, "No second overlay within the quiet window")
         await waitUntil("show via the instant path") { host.showTargetCalls.count == 2 }
         await host.drain()
         time += 1
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(factory.made.count, 2)
+        XCTAssertEqual(overlay.runs, 2)
         await waitUntil("show under the second overlay") { host.showTargetCalls.count == 3 }
-        factory.made.last?.finish()
+        overlay.finish()
         await host.drain()
     }
 
     func testNoMetalShowsInstantly() async {
         factory.isAvailable = false
         controller.turn(forward: true, isSpread: false)
-        XCTAssertTrue(factory.made.isEmpty)
+        XCTAssertTrue(overlay.runs == 0)
         await waitUntil("instant show") { host.showTargetCalls == [true] }
         await host.drain()
     }
 
     func testFailedOverlayShowsInstantly() async {
-        factory.failNextMake = true
+        overlay.failNextPrepare = true
         controller.turn(forward: true, isSpread: false)
-        XCTAssertTrue(factory.made.isEmpty)
+        XCTAssertTrue(overlay.runs == 0)
         await waitUntil("instant show") { host.showTargetCalls == [true] }
         await host.drain()
     }
@@ -204,11 +217,11 @@ final class PageCurlControllerTests: XCTestCase {
     func testEmptyCacheAssembledOnTheSpot() async {
         // Without any prefetch a tap still gets the animated path.
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(factory.made.count, 1)
+        XCTAssertEqual(overlay.runs, 1)
         XCTAssertEqual(host.currentViewCalls, 1)
         XCTAssertEqual(host.neighbourCalls, [true], "On-the-spot assembly takes only the needed direction")
         await waitUntil("show under the overlay") { host.showTargetCalls == [true] }
-        factory.made[0].finish()
+        overlay.finish()
         await host.drain()
     }
 
@@ -216,7 +229,7 @@ final class PageCurlControllerTests: XCTestCase {
         // No neighbour (not ready or the edge): the tap still does not get swallowed.
         host.nextView = nil
         controller.turn(forward: true, isSpread: false)
-        XCTAssertTrue(factory.made.isEmpty)
+        XCTAssertTrue(overlay.runs == 0)
         await waitUntil("instant show") { host.showTargetCalls == [true] }
         await host.drain()
     }
@@ -225,7 +238,7 @@ final class PageCurlControllerTests: XCTestCase {
         // A call before anything is shown: there is no current snapshot yet.
         host.currentView = nil
         controller.turn(forward: true, isSpread: false)
-        XCTAssertTrue(factory.made.isEmpty)
+        XCTAssertTrue(overlay.runs == 0)
         await waitUntil("instant show") { host.showTargetCalls == [true] }
         await host.drain()
     }
@@ -240,12 +253,12 @@ final class PageCurlControllerTests: XCTestCase {
         controller.turn(forward: true, isSpread: false)
         await waitUntil("the silent edge show") { host.showTargetCalls == [true] }
         await host.drain()
-        XCTAssertTrue(factory.made.isEmpty)
+        XCTAssertTrue(overlay.runs == 0)
 
         controller.turn(forward: false, isSpread: false)
-        XCTAssertEqual(factory.made.count, 1, "The silent edge tap did not arm the window — backward curls")
+        XCTAssertEqual(overlay.runs, 1, "The silent edge tap did not arm the window — backward curls")
         await waitUntil("show backward") { host.showTargetCalls == [true, false] }
-        factory.made[0].finish()
+        overlay.finish()
         await host.drain()
     }
 
@@ -253,13 +266,13 @@ final class PageCurlControllerTests: XCTestCase {
 
     func testRepeatTurnInterruptsAndStillShows() async {
         controller.turn(forward: true, isSpread: false)
-        let first = factory.made[0]
+        let first = overlay
         XCTAssertNotNil(first.superview)
         await waitUntil("first show") { host.showTargetCalls.count == 1 }
 
         controller.turn(forward: true, isSpread: false)
         XCTAssertNil(first.superview, "The running curl is interrupted")
-        XCTAssertEqual(factory.made.count, 1, "A repeat call goes the instant way")
+        XCTAssertEqual(overlay.runs, 1, "A repeat call goes the instant way")
         await waitUntil("second show") { host.showTargetCalls.count == 2 }
         await host.drain()
     }
@@ -320,7 +333,7 @@ final class PageCurlControllerTests: XCTestCase {
         let callsDuringCurl = host.neighbourCalls.count
         controller.prefetch()
         XCTAssertEqual(host.neighbourCalls.count, callsDuringCurl, "No rebuild while the curl is running")
-        factory.made[0].finish()
+        overlay.finish()
         XCTAssertGreaterThan(host.neighbourCalls.count, callsDuringCurl, "release() restarts the rebuild")
         await host.drain()
     }
@@ -342,10 +355,10 @@ final class PageCurlControllerTests: XCTestCase {
         controller.prefetch()
         let callsAfterPrefetch = host.currentViewCalls
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(factory.made.count, 1)
+        XCTAssertEqual(overlay.runs, 1)
         XCTAssertEqual(host.currentViewCalls, callsAfterPrefetch, "A ready cache is not re-snapshotted on a tap")
         await waitUntil("show") { host.showTargetCalls.count == 1 }
-        factory.made[0].finish()
+        overlay.finish()
         await host.drain()
     }
 
@@ -356,7 +369,6 @@ final class PageCurlControllerTests: XCTestCase {
         controller.interrupt()
 
         controller.turn(forward: true, isSpread: false)
-        let overlay = factory.made[0]
         await waitUntil("show") { host.showTargetCalls.count == 1 }
         controller.interrupt()
         XCTAssertNil(overlay.superview)
@@ -366,7 +378,6 @@ final class PageCurlControllerTests: XCTestCase {
 
     func testBackgroundNotificationInterrupts() async {
         controller.turn(forward: true, isSpread: false)
-        let overlay = factory.made[0]
         await waitUntil("show") { host.showTargetCalls.count == 1 }
         NotificationCenter.default.post(
             name: UIApplication.didEnterBackgroundNotification, object: nil
@@ -377,7 +388,6 @@ final class PageCurlControllerTests: XCTestCase {
 
     func testContainerResizeInterrupts() async {
         controller.turn(forward: true, isSpread: false)
-        let overlay = factory.made[0]
         await waitUntil("show") { host.showTargetCalls.count == 1 }
         // A real host provides views at the current size, so after a resize the views are new.
         let newSize = CGSize(width: 600, height: 800)
@@ -400,15 +410,82 @@ final class PageCurlControllerTests: XCTestCase {
         await waitUntil("the held step released") { host.pendingSteps == 0 }
     }
 
+    func testBackgroundReleasesTextures() async {
+        controller.warmUp()
+        NotificationCenter.default.post(
+            name: UIApplication.didEnterBackgroundNotification, object: nil
+        )
+        XCTAssertEqual(overlay.textureReleases, 1, "Going to the background frees the textures")
+    }
+
+    // MARK: - One view for all turns
+
+    func testOneViewForAllTurns() async {
+        controller.warmUp()
+        await completeBeautifulTurn()
+        time += 10
+        await completeBeautifulTurn()
+        XCTAssertEqual(factory.makeCalls, 1, "The view is made once and reused")
+    }
+
+    func testUndrawnFirstFrameShowsInstantlyWithoutOverlay() async {
+        overlay.failFirstFrame = true
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertNil(overlay.superview, "An undrawn first frame leaves no overlay on screen")
+        XCTAssertEqual(overlay.runs, 0)
+        await waitUntil("instant show") { host.showTargetCalls == [true] }
+        await host.drain()
+        // No run is left behind: prefetch is not held back by a curl that never started.
+        let neighbourCallsBefore = host.neighbourCalls.count
+        controller.prefetch()
+        XCTAssertGreaterThan(host.neighbourCalls.count, neighbourCallsBefore)
+
+        overlay.failFirstFrame = false
+        time += 10
+        await completeBeautifulTurn()
+    }
+
+    func testInterruptedHeldStepDoesNotHoldTheNextRun() async {
+        host.canTurnOverride = true
+        controller.turn(forward: true, isSpread: false)
+        await waitUntil("first show") { host.showTargetCalls.count == 1 }
+        for _ in 0..<50 { await Task.yield() }
+        time += 10
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertEqual(overlay.runs, 2)
+        XCTAssertNotNil(overlay.superview, "The shared view now runs the second turn")
+        await waitUntil("second show") { host.showTargetCalls.count == 2 }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(host.pendingSteps, 1, "Only the second step waits for its animation")
+        overlay.finish()
+        await host.drain()
+        XCTAssertNil(overlay.superview)
+    }
+
+    func testStepOfInterruptedRunDoesNotWaitForTheNextRun() async {
+        // The second turn comes before the first step runs: that step must not hold the queue
+        // until the second animation ends.
+        host.canTurnOverride = true
+        controller.turn(forward: true, isSpread: false)
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertEqual(overlay.runs, 2)
+        await waitUntil("both shows while the second curl runs") {
+            host.showTargetCalls.count == 2
+        }
+        XCTAssertNotNil(overlay.superview)
+        overlay.finish()
+        await host.drain()
+    }
+
     // MARK: - Paper color
 
     func testOverlayTakesPaperColorFromHost() async {
         host.paperColor = .black
         container.backgroundColor = .white
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(factory.requests[0].paperColor, .black)
+        XCTAssertEqual(overlay.requests[0].paperColor, .black)
         await waitUntil("show") { host.showTargetCalls.count == 1 }
-        factory.made[0].finish()
+        overlay.finish()
         await host.drain()
     }
 }

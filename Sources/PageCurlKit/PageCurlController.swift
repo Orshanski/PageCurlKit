@@ -17,7 +17,12 @@ public final class PageCurlController<Host: PageCurlHost> {
     private weak var host: Host?
     private weak var container: UIView?
     private let overlayFactory: PageCurlOverlayFactory
+    /// The curl view for every turn, asked from the factory until it gives one.
     private var overlay: PageCurlOverlayAnimating?
+    /// The running curl, if any. A queued step of an earlier run sees a different number and leaves
+    /// the current run alone.
+    private var activeRun: Int?
+    private var runNumber = 0
     /// Holds the host's queue step until the animation ends; an interruption releases it at once.
     private var holdContinuation: CheckedContinuation<Void, Never>?
     /// Set only after a confirmed show, so a tap at the edge of the book does not block the next turn.
@@ -63,9 +68,12 @@ public final class PageCurlController<Host: PageCurlHost> {
         self.overlayFactory = overlayFactory
         sizeSentinel.frame = container.bounds
         sizeSentinel.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        sizeSentinel.onSizeChange = { [weak self] in self?.interrupt() }
+        sizeSentinel.onSizeChange = { [weak self] in self?.interrupt(reason: "container resized") }
         container.insertSubview(sizeSentinel, at: 0)
-        backgroundWatcher = BackgroundWatcher { [weak self] in self?.interrupt() }
+        backgroundWatcher = BackgroundWatcher { [weak self] in
+            self?.interrupt(reason: "app went to the background")
+            self?.overlay?.releaseTextures()
+        }
     }
 
     deinit {
@@ -73,53 +81,73 @@ public final class PageCurlController<Host: PageCurlHost> {
         holdContinuation?.resume()
     }
 
-    /// Compiles the shaders ahead of time. Call it when the pager opens; otherwise the first curl
-    /// drops frames.
+    /// Creates the curl view and compiles its shaders ahead of time. Call it when the pager opens;
+    /// otherwise the first curl drops frames.
     public func warmUp() {
-        overlayFactory.warmUp()
+        _ = curlView()
+    }
+
+    private func curlView() -> PageCurlOverlayAnimating? {
+        if overlay == nil {
+            overlay = overlayFactory.makeOverlay()
+        }
+        return overlay
     }
 
     public func turn(
         forward: Bool, isSpread: Bool,
         progress: PageCurlProgressSource = .timed
     ) {
+        let touchedAt = CACurrentMediaTime()
         // A call during a running curl cancels it and then proceeds as usual.
-        if overlay != nil {
-            release()
-        }
+        interrupt(reason: "a new turn")
         guard let host, let container else { return }
         if progress == .gesture {
             assertionFailure("Finger tracking is not implemented: .gesture is a stub")
-            enqueueInstantShow(forward: forward, host: host)
-            return
+            return enqueueInstantShow(forward: forward, host: host, reason: "finger tracking is a stub")
         }
         // These checks run before anything is enqueued; that is what lets the host treat an empty
         // queue as "not busy".
         let size = container.bounds.size
-        guard host.canTurn(),
-              now() - lastShownAt > configuration.duration,
-              overlayFactory.isAvailable,
-              size.width > 0, size.height > 0,
-              let pair = snapshotPair(forward: forward, host: host, size: size),
-              let overlay = overlayFactory.makeOverlay(PageCurlOverlayRequest(
-                  currentSpread: pair.current,
-                  targetSpread: pair.target,
-                  sizePoints: size,
-                  forward: forward,
-                  isSpread: isSpread,
-                  paperColor: host.paperColor,
-                  configuration: configuration
-              ))
-        else {
-            enqueueInstantShow(forward: forward, host: host)
-            return
+        guard host.canTurn() else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "host is busy", isFailure: false)
+        }
+        guard now() - lastShownAt > configuration.duration else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent", isFailure: false)
+        }
+        guard let overlay = curlView() else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "no curl view (no Metal)")
+        }
+        guard size.width > 0, size.height > 0 else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "empty container")
+        }
+        guard let pair = snapshotPair(forward: forward, host: host, size: size) else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "no snapshots")
+        }
+        guard overlay.prepare(PageCurlOverlayRequest(
+            currentSpread: pair.current,
+            targetSpread: pair.target,
+            sizePoints: size,
+            forward: forward,
+            isSpread: isSpread,
+            paperColor: host.paperColor,
+            configuration: configuration
+        )) else {
+            return enqueueInstantShow(forward: forward, host: host, reason: "overlay not prepared")
         }
 
-        overlay.frame = container.bounds
+        runNumber += 1
+        let run = runNumber
         container.addSubview(overlay)
-        self.overlay = overlay
+        activeRun = run
         overlay.onFinished = { [weak self] in self?.release() }
-        overlay.start()
+        curlLog.debug("turn \(run) started: forward \(forward), spread \(isSpread)")
+        guard overlay.startIfFirstFrameDrawn() else {
+            stopRun()
+            return enqueueInstantShow(forward: forward, host: host, reason: "first frame not drawn")
+        }
+        let milliseconds = (CACurrentMediaTime() - touchedAt) * 1000
+        curlLog.notice("turn \(run): first frame \(milliseconds, format: .fixed(precision: 1)) ms after the touch")
 
         // Weak captures only: the step waits until the animation ends, and a strong reference
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
@@ -135,11 +163,13 @@ public final class PageCurlController<Host: PageCurlHost> {
             } else {
                 // The host provided a neighbour view but then could not show it: an integration bug.
                 assertionFailure("showTarget did not show the spread the host provided a view for")
-                self?.release()
+                if let self, self.activeRun == run {
+                    self.interrupt(reason: "showTarget showed nothing", isFailure: true)
+                }
                 return
             }
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                guard let self, self.overlay != nil else {
+                guard let self, self.activeRun == run else {
                     continuation.resume()
                     return
                 }
@@ -152,7 +182,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// turn snapshots the spreads on the spot.
     public func prefetch() {
         // During a curl the main thread is busy with frames; release() restarts the rebuild.
-        guard overlay == nil else { return }
+        guard activeRun == nil else { return }
         // After the frame commits: rebuilding in the same run loop pass would stall the first
         // frames of the animation.
         afterFrameCommit { [weak self] in
@@ -169,19 +199,39 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// Stops a running curl. Call it when something makes the animation stale, for example a show
     /// that bypasses the controller or an opened menu.
     public func interrupt() {
-        guard overlay != nil else { return }
+        interrupt(reason: "host interrupted")
+    }
+
+    private func interrupt(reason: String, isFailure: Bool = false) {
+        guard let activeRun else { return }
+        if isFailure {
+            curlLog.error("turn \(activeRun) interrupted: \(reason, privacy: .public)")
+        } else {
+            curlLog.debug("turn \(activeRun) interrupted: \(reason, privacy: .public)")
+        }
         release()
     }
 
     private func release() {
-        overlay?.removeFromSuperview()
-        overlay = nil
+        stopRun()
         holdContinuation?.resume()
         holdContinuation = nil
         prefetch()
     }
 
-    private func enqueueInstantShow(forward: Bool, host: Host) {
+    private func stopRun() {
+        overlay?.stop()
+        overlay?.removeFromSuperview()
+        activeRun = nil
+    }
+
+    /// `isFailure` false — an expected fallback (busy host, rapid tapping), logged at debug level.
+    private func enqueueInstantShow(forward: Bool, host: Host, reason: String, isFailure: Bool = true) {
+        if isFailure {
+            curlLog.error("instant show: \(reason, privacy: .public)")
+        } else {
+            curlLog.debug("instant show: \(reason, privacy: .public)")
+        }
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
             let from = host.currentPosition
@@ -215,7 +265,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func rebuildCache() {
-        guard overlay == nil, let host, let container else { return }
+        guard activeRun == nil, let host, let container else { return }
         let size = container.bounds.size
         guard size.width > 0, size.height > 0 else { return }
         fillCache(host: host, size: size, next: true, previous: true)
