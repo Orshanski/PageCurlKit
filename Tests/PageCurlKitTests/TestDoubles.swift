@@ -65,16 +65,30 @@ final class FakeHost: PageCurlHost {
     }
 }
 
+final class FakeSnapshot: LoadedSnapshot {}
+
 /// No Metal; one view for all turns, like the real one. The test finishes the animation itself.
 @MainActor
 final class FakeOverlay: UIView, PageCurlOverlayAnimating {
     var onFinished: (() -> Void)?
     var failNextPrepare = false
     var failFirstFrame = false
+    /// How many more snapshots load before loading starts to fail; nil — never fails.
+    var successfulLoadsLeft: Int?
+    private(set) var loads = 0
     private(set) var requests: [PageCurlOverlayRequest] = []
     /// Started animations, that is turns that went the animated way.
     private(set) var runs = 0
     private(set) var textureReleases = 0
+
+    func load(_ snapshot: UIImage) -> LoadedSnapshot? {
+        if let left = successfulLoadsLeft {
+            guard left > 0 else { return nil }
+            successfulLoadsLeft = left - 1
+        }
+        loads += 1
+        return FakeSnapshot()
+    }
 
     func prepare(_ request: PageCurlOverlayRequest) -> Bool {
         if failNextPrepare {

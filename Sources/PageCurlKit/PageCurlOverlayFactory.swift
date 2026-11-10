@@ -1,9 +1,13 @@
 import UIKit
 import Metal
 
+/// A snapshot already in the curl view's memory. The controller only keeps it and hands it back in
+/// a request, so it knows nothing about how the view stores it.
+protocol LoadedSnapshot: AnyObject {}
+
 struct PageCurlOverlayRequest {
-    let currentSpread: UIImage
-    let targetSpread: UIImage
+    let currentSpread: LoadedSnapshot
+    let targetSpread: LoadedSnapshot
     let sizePoints: CGSize
     let forward: Bool
     let isSpread: Bool
@@ -15,12 +19,16 @@ struct PageCurlOverlayRequest {
 @MainActor
 protocol PageCurlOverlayAnimating: UIView {
     var onFinished: (() -> Void)? { get set }
-    /// Loads one turn and takes its size; false — this turn cannot be animated.
+    /// Moves the snapshot's pixels into the view's memory once; nil — it could not be loaded. The
+    /// image is not kept.
+    func load(_ snapshot: UIImage) -> LoadedSnapshot?
+    /// Takes one turn and its size; false — this turn cannot be animated.
     func prepare(_ request: PageCurlOverlayRequest) -> Bool
     func startIfFirstFrameDrawn() -> Bool
-    /// Stops drawing and drops `onFinished`, so an interrupted run cannot finish the next one.
+    /// Stops drawing, drops `onFinished` and the turn's snapshots, so an interrupted run cannot
+    /// finish the next one and a finished one does not keep snapshots the controller let go.
     func stop()
-    /// Frees the snapshot textures and render targets; the next `prepare` allocates them again.
+    /// Frees the render targets; the next frame allocates them again.
     func releaseTextures()
 }
 
