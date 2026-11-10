@@ -34,7 +34,8 @@ final class PageCurlOverlayViewTests: XCTestCase {
         let red = try XCTUnwrap(view.load(Self.image(.red)))
         let blue = try XCTUnwrap(view.load(Self.image(.blue)))
 
-        // The first frame shows the current spread; the leaf's shading may darken it slightly.
+        // The first frame shows the current spread. On a leaf this small the shading next to the
+        // fold reaches the centre and darkens it slightly.
         assertColor(try frames.firstFrame(current: red, target: blue, forward: true), [0, 0, 255, 255])
         assertColor(try frames.firstFrame(current: blue, target: red, forward: false), [255, 0, 0, 255])
         assertColor(try frames.firstFrame(current: red, target: blue, forward: true), [0, 0, 255, 255])
@@ -51,18 +52,20 @@ final class PageCurlOverlayViewTests: XCTestCase {
     func testStopLetsGoOfTheTurnSnapshots() throws {
         let view = try XCTUnwrap(PageCurlOverlayView(device: try device()))
         let frames = FrameGrabber(view)
-        weak var texture: MTLTexture?
+        weak var current: MTLTexture?
+        weak var target: MTLTexture?
         try autoreleasepool {
             let red = try XCTUnwrap(view.load(Self.image(.red)))
             let blue = try XCTUnwrap(view.load(Self.image(.blue)))
-            texture = (red as? SnapshotTexture)?.texture
-            assertColor(try frames.firstFrame(current: red, target: blue, forward: true), [0, 0, 255, 255])
+            current = (red as? SnapshotTexture)?.texture
+            target = (blue as? SnapshotTexture)?.texture
+            // No frame is drawn: a submitted frame would hold the textures until some unknown
+            // moment after the GPU finishes it.
+            frames.prepare(current: red, target: blue, forward: true)
+            view.stop()
         }
-        // The submitted frame holds the texture until the GPU finishes it.
-        for _ in 0..<200 where texture != nil {
-            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
-        }
-        XCTAssertNil(texture, "After stop() the view keeps no snapshot of the turn")
+        XCTAssertNil(current, "After stop() the view keeps no snapshot of the turn")
+        XCTAssertNil(target, "After stop() the view keeps no snapshot of the turn")
     }
 
     func testRunningTurnHoldsItsSnapshotsItself() throws {
@@ -105,14 +108,6 @@ final class PageCurlOverlayViewTests: XCTestCase {
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
         func draw(in mtkView: MTKView) {
-            // Drawables are reused, so the one handed out may still show an earlier turn.
-            if let texture = mtkView.currentDrawable?.texture {
-                let zeros = [UInt8](repeating: 0, count: texture.width * texture.height * 4)
-                texture.replace(
-                    region: MTLRegionMake2D(0, 0, texture.width, texture.height),
-                    mipmapLevel: 0, withBytes: zeros, bytesPerRow: texture.width * 4
-                )
-            }
             view.draw(in: mtkView)
             drawn = mtkView.currentDrawable?.texture
         }
@@ -134,20 +129,26 @@ final class PageCurlOverlayViewTests: XCTestCase {
         /// Draws the prepared turn's first frame and stops the view.
         func drawFirstFrame() throws -> [UInt8] {
             drawn = nil
-            XCTAssertTrue(view.startIfFirstFrameDrawn())
+            let started = view.startIfFirstFrameDrawn()
             view.stop()
-            let texture = try XCTUnwrap(drawn, "No frame was drawn")
-            // The first frame is committed and only scheduled; wait for the GPU to write it.
-            var pixel = [UInt8](repeating: 0, count: 4)
-            for _ in 0..<200 {
-                texture.getBytes(
-                    &pixel, bytesPerRow: 4,
-                    from: MTLRegionMake2D(side / 2, side / 2, 1, 1), mipmapLevel: 0
-                )
-                if pixel != [0, 0, 0, 0] { break }
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            return pixel
+            let texture = try XCTUnwrap(started ? drawn : nil, "The first frame was not drawn")
+            // A copy on the same queue starts only after the frame has written the texture.
+            let device = try XCTUnwrap(view.device)
+            let pixel = try XCTUnwrap(device.makeBuffer(length: 4, options: .storageModeShared))
+            let commands = try XCTUnwrap(view.commandQueue.makeCommandBuffer())
+            let blit = try XCTUnwrap(commands.makeBlitCommandEncoder())
+            blit.copy(
+                from: texture, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: side / 2, y: side / 2, z: 0),
+                sourceSize: MTLSize(width: 1, height: 1, depth: 1),
+                to: pixel, destinationOffset: 0, destinationBytesPerRow: 4, destinationBytesPerImage: 4
+            )
+            blit.endEncoding()
+            commands.commit()
+            commands.waitUntilCompleted()
+            return Array(UnsafeBufferPointer(
+                start: pixel.contents().assumingMemoryBound(to: UInt8.self), count: 4
+            ))
         }
     }
 }

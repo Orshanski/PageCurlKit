@@ -13,7 +13,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     /// then not called.
     public var onFinished: (() -> Void)?
 
-    private let commandQueue: MTLCommandQueue
+    let commandQueue: MTLCommandQueue
     private let leafPipeline: MTLRenderPipelineState
     private let backgroundPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
