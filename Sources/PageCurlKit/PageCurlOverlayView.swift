@@ -20,7 +20,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     private let quadBuffers: [BackgroundQuad: MTLBuffer]
     private let renderTargetStorage: MTLStorageMode
 
-    // The snapshots of the turn being played; the controller's cache owns them too.
+    // The snapshots of the turn being played, held by the view itself from `prepare` until `stop`.
     private var currentTexture: MTLTexture?
     private var targetTexture: MTLTexture?
     private var leafMesh: LeafMesh?
@@ -219,7 +219,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         guard let current = (request.currentSpread as? SnapshotTexture)?.texture,
               let target = (request.targetSpread as? SnapshotTexture)?.texture
         else {
-            curlLog.error("overlay not prepared: the snapshots were not loaded by this view")
+            curlLog.error("overlay not prepared: the snapshots were not loaded by a curl view")
             return false
         }
         currentTexture = current
@@ -340,7 +340,7 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         targetTexture = nil
     }
 
-    func releaseTextures() {
+    func releaseRenderTargets() {
         multisampleTexture = nil
         depthTexture = nil
     }
@@ -472,7 +472,7 @@ extension PageCurlOverlayView: MTKViewDelegate {
 }
 
 /// The curl view's form of a loaded snapshot.
-private final class SnapshotTexture: LoadedSnapshot {
+final class SnapshotTexture: LoadedSnapshot {
     let texture: MTLTexture
 
     init(texture: MTLTexture) {

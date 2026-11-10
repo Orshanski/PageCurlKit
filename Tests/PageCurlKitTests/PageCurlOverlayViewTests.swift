@@ -48,6 +48,35 @@ final class PageCurlOverlayViewTests: XCTestCase {
         XCTAssertTrue(close, "\(pixel) is not \(expected)", file: file, line: line)
     }
 
+    func testStopLetsGoOfTheTurnSnapshots() throws {
+        let view = try XCTUnwrap(PageCurlOverlayView(device: try device()))
+        let frames = FrameGrabber(view)
+        weak var texture: MTLTexture?
+        try autoreleasepool {
+            let red = try XCTUnwrap(view.load(Self.image(.red)))
+            let blue = try XCTUnwrap(view.load(Self.image(.blue)))
+            texture = (red as? SnapshotTexture)?.texture
+            assertColor(try frames.firstFrame(current: red, target: blue, forward: true), [0, 0, 255, 255])
+        }
+        // The submitted frame holds the texture until the GPU finishes it.
+        for _ in 0..<200 where texture != nil {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        XCTAssertNil(texture, "After stop() the view keeps no snapshot of the turn")
+    }
+
+    func testRunningTurnHoldsItsSnapshotsItself() throws {
+        let view = try XCTUnwrap(PageCurlOverlayView(device: try device()))
+        let frames = FrameGrabber(view)
+        try autoreleasepool {
+            let red = try XCTUnwrap(view.load(Self.image(.red)))
+            let blue = try XCTUnwrap(view.load(Self.image(.blue)))
+            frames.prepare(current: red, target: blue, forward: true)
+        }
+        // Nobody else holds the snapshots now, as after a memory warning mid-turn.
+        assertColor(try frames.drawFirstFrame(), [0, 0, 255, 255])
+    }
+
     private static let side = 8
 
     private static func image(_ color: UIColor) -> UIImage {
@@ -89,12 +118,21 @@ final class PageCurlOverlayViewTests: XCTestCase {
         }
 
         func firstFrame(current: LoadedSnapshot, target: LoadedSnapshot, forward: Bool) throws -> [UInt8] {
+            prepare(current: current, target: target, forward: forward)
+            return try drawFirstFrame()
+        }
+
+        func prepare(current: LoadedSnapshot, target: LoadedSnapshot, forward: Bool) {
             let size = CGSize(width: side, height: side)
             XCTAssertTrue(view.prepare(PageCurlOverlayRequest(
                 currentSpread: current, targetSpread: target, sizePoints: size,
                 forward: forward, isSpread: false, paperColor: .white,
                 configuration: PageCurlConfiguration()
             )))
+        }
+
+        /// Draws the prepared turn's first frame and stops the view.
+        func drawFirstFrame() throws -> [UInt8] {
             drawn = nil
             XCTAssertTrue(view.startIfFirstFrameDrawn())
             view.stop()

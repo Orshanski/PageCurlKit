@@ -14,12 +14,12 @@ final class ControllerViewTests: ControllerTestCase {
         XCTAssertEqual(factory.makeCalls, 1, "The view is made once and reused")
     }
 
-    func testBackgroundReleasesTextures() async {
+    func testBackgroundReleasesRenderTargets() async {
         controller.warmUp()
         NotificationCenter.default.post(
             name: UIApplication.didEnterBackgroundNotification, object: nil
         )
-        XCTAssertEqual(overlay.textureReleases, 1, "Going to the background frees the textures")
+        XCTAssertEqual(overlay.renderTargetReleases, 1, "Going to the background frees the render targets")
     }
 
     func testRequestDescribesTheTurn() async {

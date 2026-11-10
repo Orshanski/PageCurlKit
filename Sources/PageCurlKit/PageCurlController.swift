@@ -77,7 +77,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     private func enterBackground() {
         isInBackground = true
         interrupt(reason: "app went to the background")
-        overlay?.releaseTextures()
+        overlay?.releaseRenderTargets()
         cache = nil
     }
 

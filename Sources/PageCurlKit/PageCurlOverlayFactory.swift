@@ -29,7 +29,7 @@ protocol PageCurlOverlayAnimating: UIView {
     /// finish the next one and a finished one does not keep snapshots the controller let go.
     func stop()
     /// Frees the render targets; the next frame allocates them again.
-    func releaseTextures()
+    func releaseRenderTargets()
 }
 
 @MainActor

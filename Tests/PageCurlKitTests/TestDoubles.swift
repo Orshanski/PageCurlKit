@@ -79,7 +79,7 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
     private(set) var requests: [PageCurlOverlayRequest] = []
     /// Started animations, that is turns that went the animated way.
     private(set) var runs = 0
-    private(set) var textureReleases = 0
+    private(set) var renderTargetReleases = 0
 
     func load(_ snapshot: UIImage) -> LoadedSnapshot? {
         if let left = successfulLoadsLeft {
@@ -109,8 +109,8 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
         onFinished = nil
     }
 
-    func releaseTextures() {
-        textureReleases += 1
+    func releaseRenderTargets() {
+        renderTargetReleases += 1
     }
 
     func finish() {
