@@ -9,9 +9,9 @@ Two API layers:
 - **Conductor** — `PageCurlController` + the `PageCurlHost` protocol: snapshot
   cache, quiet window, interruption, queueing — the whole mechanics of turning
   with a curl. The controller keeps one curl view for all turns: each snapshot
-  becomes a texture once, when it is taken, and is kept only there, so a prefetched
-  turn copies no pixels; on Apple GPUs the multisample and depth buffers take no
-  memory at all.
+  becomes a texture once, when it is taken, and is kept only there, so a
+  prefetched turn copies no pixels; on Apple GPUs the multisample and depth
+  buffers take no memory at all.
 - **Bare effect** — `PageCurlOverlayView`: two snapshots in, a self-driving
   animation to completion. For those who only need the render.
 
@@ -20,7 +20,7 @@ Two API layers:
 iOS 17+, Swift 6. Add the package with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "1.0.0")
+.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "1.2.0")
 ```
 
 ## Every call turns the page
@@ -154,7 +154,8 @@ final class MiniPagerViewController: UIViewController, PageCurlHost {
 - **`prefetch()`** — after every show and after a neighbour becomes ready.
   Otherwise every curl pays for on-the-spot snapshot assembly (~0.1 s on
   an iPad). The library drops the snapshots in the background and on a memory
-  warning, and rebuilds them by itself on return to the foreground.
+  warning. On return to the foreground it rebuilds them by itself; after a
+  memory warning they come back with the next `prefetch()` or turn.
 - **`warmUp()`** — when the pager opens.
 - **`interrupt()`** — on host events incompatible with letting the animation
   finish: shows that bypass the library (table of contents, position
