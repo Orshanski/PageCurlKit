@@ -39,7 +39,9 @@ public final class PageCurlController<Host: PageCurlHost> {
     private var cache: SnapshotCache<Host.Position, UIImage>?
 
     private let sizeSentinel = ContainerSizeSentinel()
-    private var backgroundWatcher: BackgroundWatcher?
+    private var appWatcher: AppNotificationWatcher?
+    /// Snapshots built in the background would stay in memory the whole time the app is away.
+    private var isInBackground = false
 
     public convenience init(
         host: Host, container: UIView,
@@ -63,10 +65,25 @@ public final class PageCurlController<Host: PageCurlHost> {
         sizeSentinel.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         sizeSentinel.onSizeChange = { [weak self] in self?.interrupt(reason: "container resized") }
         container.insertSubview(sizeSentinel, at: 0)
-        backgroundWatcher = BackgroundWatcher { [weak self] in
-            self?.interrupt(reason: "app went to the background")
-            self?.overlay?.releaseTextures()
-        }
+        appWatcher = AppNotificationWatcher([
+            UIApplication.didEnterBackgroundNotification: { [weak self] in self?.enterBackground() },
+            UIApplication.willEnterForegroundNotification: { [weak self] in self?.enterForeground() },
+            // A running curl already holds its textures, so dropping the snapshots does not stop it.
+            UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.cache = nil },
+        ])
+    }
+
+    private func enterBackground() {
+        // Set first: the interruption schedules a rebuild that runs after this handler.
+        isInBackground = true
+        interrupt(reason: "app went to the background")
+        overlay?.releaseTextures()
+        cache = nil
+    }
+
+    private func enterForeground() {
+        isInBackground = false
+        prefetch()
     }
 
     deinit {
@@ -252,7 +269,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func rebuildCache() {
-        guard activeRun == nil, let host, let container else { return }
+        guard activeRun == nil, !isInBackground, let host, let container else { return }
         let size = container.bounds.size
         guard size.width > 0, size.height > 0 else { return }
         fillCache(host: host, size: size, directions: [true, false])
@@ -291,21 +308,19 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 }
 
-private final class BackgroundWatcher {
-    private let token: NSObjectProtocol
+private final class AppNotificationWatcher {
+    private let tokens: [NSObjectProtocol]
 
-    init(onBackground: @escaping @MainActor () -> Void) {
-        token = NotificationCenter.default.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            MainActor.assumeIsolated { onBackground() }
+    init(_ handlers: [Notification.Name: @MainActor () -> Void]) {
+        tokens = handlers.map { name, handler in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { handler() }
+            }
         }
     }
 
     deinit {
-        NotificationCenter.default.removeObserver(token)
+        tokens.forEach(NotificationCenter.default.removeObserver)
     }
 }
 
