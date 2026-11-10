@@ -185,6 +185,11 @@ maximum). Mutable on a live controller; applies starting with the next curl.
 There is no paper color in the configuration — it comes from
 `PageCurlHost.paperColor`.
 
+On an iPhone with a ProMotion display the curl runs above 60 frames per
+second only if the app's `Info.plist` sets
+`CADisableMinimumFrameDurationOnPhone` to `true`; an iPad Pro needs no key.
+See Apple's [Optimizing iPhone and iPad apps to support ProMotion displays](https://developer.apple.com/documentation/quartzcore/optimizing-iphone-and-ipad-apps-to-support-promotion-displays).
+
 Finger tracking (`PageCurlProgressSource.gesture`) is a stub: the entry point
 is reserved, the implementation is not there yet.
 
