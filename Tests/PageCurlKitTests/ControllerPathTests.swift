@@ -15,6 +15,8 @@ final class ControllerPathTests: ControllerTestCase {
             ("no neighbour", { $0.host.nextView = nil }),
             // A call before anything is shown.
             ("no current spread", { $0.host.currentView = nil }),
+            ("current snapshot not loaded", { $0.overlay.successfulLoadsLeft = 0 }),
+            ("target snapshot not loaded", { $0.overlay.successfulLoadsLeft = 1 }),
         ]
         for fallback in fallbacks {
             makeFixture()

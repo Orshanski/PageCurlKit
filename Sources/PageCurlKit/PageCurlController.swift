@@ -36,7 +36,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         }
     }
 
-    private var cache: SnapshotCache<Host.Position, UIImage>?
+    private var cache: SnapshotCache<Host.Position, LoadedSnapshot>?
 
     private let sizeSentinel = ContainerSizeSentinel()
     private var appWatcher: AppNotificationWatcher?
@@ -68,7 +68,8 @@ public final class PageCurlController<Host: PageCurlHost> {
         appWatcher = AppNotificationWatcher([
             UIApplication.didEnterBackgroundNotification: { [weak self] in self?.enterBackground() },
             UIApplication.willEnterForegroundNotification: { [weak self] in self?.enterForeground() },
-            // A running curl already holds its textures, so dropping the snapshots does not stop it.
+            // A running curl holds its own two snapshots until it stops, so dropping the cache does
+            // not break it.
             UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.cache = nil },
         ])
     }
@@ -76,7 +77,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     private func enterBackground() {
         isInBackground = true
         interrupt(reason: "app went to the background")
-        overlay?.releaseTextures()
+        overlay?.releaseRenderTargets()
         cache = nil
     }
 
@@ -130,7 +131,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         guard size.width > 0, size.height > 0 else {
             return enqueueInstantShow(forward: forward, host: host, reason: "empty container")
         }
-        guard let pair = snapshotPair(forward: forward, host: host, size: size) else {
+        guard let pair = snapshotPair(forward: forward, host: host, size: size, overlay: overlay) else {
             return enqueueInstantShow(forward: forward, host: host, reason: "no snapshots")
         }
         guard overlay.prepare(PageCurlOverlayRequest(
@@ -261,49 +262,53 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func snapshotPair(
-        forward: Bool, host: Host, size: CGSize
-    ) -> (current: UIImage, target: UIImage)? {
-        fillCache(host: host, size: size, directions: [forward])
+        forward: Bool, host: Host, size: CGSize, overlay: PageCurlOverlayAnimating
+    ) -> (current: LoadedSnapshot, target: LoadedSnapshot)? {
+        fillCache(host: host, size: size, overlay: overlay, directions: [forward])
         return cache?.pair(forward: forward)
     }
 
     private func rebuildCache() {
         guard activeRun == nil, !isInBackground, let host, let container else { return }
         let size = container.bounds.size
-        guard size.width > 0, size.height > 0 else { return }
-        fillCache(host: host, size: size, directions: [true, false])
+        guard size.width > 0, size.height > 0, let overlay = curlView() else { return }
+        fillCache(host: host, size: size, overlay: overlay, directions: [true, false])
     }
 
     /// Snapshots what the cache lacks: the spread on screen if the cache is for another position or
     /// size, and the missing neighbours in `directions` (true — ahead).
-    private func fillCache(host: Host, size: CGSize, directions: [Bool]) {
+    private func fillCache(
+        host: Host, size: CGSize, overlay: PageCurlOverlayAnimating, directions: [Bool]
+    ) {
         let position = host.currentPosition
         if cache?.isValid(for: position, size: size) != true {
-            guard let view = host.currentSpreadView() else {
+            guard let view = host.currentSpreadView(),
+                  let current = snapshot(of: view, size: size, paper: host.paperColor, into: overlay)
+            else {
                 cache = nil
                 return
             }
-            cache = SnapshotCache(
-                position: position, size: size,
-                current: snapshot(of: view, size: size, paper: host.paperColor)
-            )
+            cache = SnapshotCache(position: position, size: size, current: current)
         }
         for forward in directions where cache?.neighbour(forward: forward) == nil {
-            let image = host.neighbourSpreadView(forward: forward)
-                .map { snapshot(of: $0, size: size, paper: host.paperColor) }
-            cache?.setNeighbour(image, forward: forward)
+            let neighbour = host.neighbourSpreadView(forward: forward)
+                .flatMap { snapshot(of: $0, size: size, paper: host.paperColor, into: overlay) }
+            cache?.setNeighbour(neighbour, forward: forward)
         }
     }
 
     /// The Metal view is opaque, so transparent pixels would turn black; paper is drawn underneath.
-    private func snapshot(of view: UIView, size: CGSize, paper: UIColor) -> UIImage {
+    private func snapshot(
+        of view: UIView, size: CGSize, paper: UIColor, into overlay: PageCurlOverlayAnimating
+    ) -> LoadedSnapshot? {
         assert(view.bounds.size == size, "The host spread view must match the container size")
         view.layoutIfNeeded()
-        return UIGraphicsImageRenderer(size: size, format: SnapshotRaster.rendererFormat()).image { context in
+        let image = UIGraphicsImageRenderer(size: size, format: SnapshotRaster.rendererFormat()).image { context in
             paper.setFill()
             context.fill(CGRect(origin: .zero, size: size))
             view.layer.render(in: context.cgContext)
         }
+        return overlay.load(image)
     }
 }
 

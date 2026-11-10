@@ -52,6 +52,37 @@ final class ControllerCacheTests: ControllerTestCase {
         XCTAssertTrue(back.targetSpread === first.currentSpread, "Turning back leads to where it came from")
     }
 
+    func testPrefetchedSnapshotsAreNotLoadedAgainOnTurn() async {
+        controller.prefetch()
+        XCTAssertEqual(overlay.loads, 3, "The spread on screen and both neighbours")
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertEqual(overlay.runs, 1)
+        XCTAssertEqual(overlay.loads, 3, "Neither the current nor the target snapshot is loaded on a tap")
+        await waitUntil("show under the overlay") { host.showTargetCalls.count == 1 }
+        overlay.finish()
+        await host.drain()
+    }
+
+    func testAfterTurnNextTurnEitherWayUsesLoadedSnapshots() async {
+        for forward in [true, false] {
+            makeFixture()
+            controller.prefetch()
+            await completeBeautifulTurn(forward: true)
+            let loadsBefore = overlay.loads
+            time += 10
+            controller.turn(forward: forward, isSpread: false)
+            XCTAssertEqual(overlay.runs, 2, "forward \(forward): the animated path")
+            XCTAssertEqual(overlay.loads, loadsBefore, "forward \(forward): nothing is loaded on a tap")
+            XCTAssertTrue(
+                overlay.requests[1].currentSpread === overlay.requests[0].targetSpread,
+                "forward \(forward): the first turn's target is now current"
+            )
+            await waitUntil("show under the overlay") { host.showTargetCalls.count == 2 }
+            overlay.finish()
+            await host.drain()
+        }
+    }
+
     func testPrefetchWaitsForCurlEndAndRestartsOnRelease() async {
         controller.turn(forward: true, isSpread: false)
         await waitUntil("show") { host.showTargetCalls.count == 1 }

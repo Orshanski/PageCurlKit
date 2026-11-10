@@ -57,7 +57,7 @@ final class ControllerMemoryTests: ControllerTestCase {
 
         post(UIApplication.didReceiveMemoryWarningNotification)
         XCTAssertNotNil(overlay.superview, "A memory warning does not interrupt the curl")
-        XCTAssertEqual(overlay.textureReleases, 0, "A memory warning leaves the textures of the curl alone")
+        XCTAssertEqual(overlay.renderTargetReleases, 0, "A memory warning leaves the render targets of the curl alone")
 
         overlay.finish()
         await host.drain()

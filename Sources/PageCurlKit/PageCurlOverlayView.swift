@@ -13,14 +13,14 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     /// then not called.
     public var onFinished: (() -> Void)?
 
-    private let commandQueue: MTLCommandQueue
+    let commandQueue: MTLCommandQueue
     private let leafPipeline: MTLRenderPipelineState
     private let backgroundPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let quadBuffers: [BackgroundQuad: MTLBuffer]
     private let renderTargetStorage: MTLStorageMode
 
-    // Refilled by `prepare` for every turn; allocated again only when the size changes.
+    // The snapshots of the turn being played, held by the view itself from `prepare` until `stop`.
     private var currentTexture: MTLTexture?
     private var targetTexture: MTLTexture?
     private var leafMesh: LeafMesh?
@@ -34,8 +34,6 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
     private var framesPerSecond = 0
     private var startTime: CFTimeInterval = 0
     private var finished = true
-    /// The last submitted frame; the snapshot textures are not overwritten while it may still read them.
-    private var lastCommandBuffer: MTLCommandBuffer?
     /// Why the last frame was not drawn; nil when it was.
     private var frameFailure: String?
 
@@ -130,7 +128,8 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         #endif
     }
 
-    /// An empty view for repeated turns: `prepare` loads each turn, `startIfFirstFrameDrawn` runs it.
+    /// An empty view for repeated turns: `load` takes the snapshots, `prepare` takes each turn,
+    /// `startIfFirstFrameDrawn` runs it.
     init?(device: MTLDevice) {
         let shared: (
             queue: MTLCommandQueue,
@@ -188,8 +187,9 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         configuration: PageCurlConfiguration = PageCurlConfiguration()
     ) {
         self.init(device: device)
+        guard let current = load(currentSpread), let target = load(targetSpread) else { return nil }
         guard prepare(PageCurlOverlayRequest(
-            currentSpread: currentSpread, targetSpread: targetSpread, sizePoints: sizePoints,
+            currentSpread: current, targetSpread: target, sizePoints: sizePoints,
             forward: forward, isSpread: isSpread, paperColor: paperColor,
             configuration: configuration
         )) else { return nil }
@@ -200,25 +200,29 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         fatalError("init(coder:) is not used")
     }
 
-    /// Loads one turn into the view, reusing the textures and the mesh when the size is unchanged.
+    func load(_ snapshot: UIImage) -> LoadedSnapshot? {
+        guard let device else { return nil }
+        do {
+            return SnapshotTexture(texture: try Self.makeTexture(from: snapshot, device: device))
+        } catch {
+            curlLog.error("snapshot not loaded: \(error.rawValue, privacy: .public)")
+            return nil
+        }
+    }
+
+    /// Takes the loaded snapshots of one turn without copying pixels; reuses the mesh when the size
+    /// is unchanged.
     func prepare(_ request: PageCurlOverlayRequest) -> Bool {
         let sizePoints = request.sizePoints
         let configuration = request.configuration
         guard let device, sizePoints.width > 0, sizePoints.height > 0 else { return false }
-        lastCommandBuffer?.waitUntilCompleted()
-        lastCommandBuffer = nil
-
-        let current: MTLTexture
-        let target: MTLTexture
-        do {
-            current = try Self.loadSnapshot(request.currentSpread, reusing: currentTexture, device: device)
-            target = try Self.loadSnapshot(request.targetSpread, reusing: targetTexture, device: device)
-        } catch {
-            curlLog.error("overlay not prepared: \(error.rawValue, privacy: .public)")
+        guard let current = (request.currentSpread as? SnapshotTexture)?.texture,
+              let target = (request.targetSpread as? SnapshotTexture)?.texture
+        else {
+            curlLog.error("overlay not prepared: the snapshots were not loaded by a curl view")
+            assertionFailure("The snapshots of a turn must come from load(_:) of a curl view")
             return false
         }
-        currentTexture = current
-        targetTexture = target
 
         var red: CGFloat = 1, green: CGFloat = 1, blue: CGFloat = 1, alpha: CGFloat = 1
         request.paperColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
@@ -226,17 +230,21 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
             sizePoints: sizePoints, isSpread: request.isSpread, forward: request.forward,
             paper: (Float(red), Float(green), Float(blue)), configuration: configuration
         )
-        if leafMesh?.width != trajectory.sheetWidth || leafMesh?.height != trajectory.sheetHeight {
-            leafMesh = nil
-            guard let mesh = Self.makeLeafMesh(
+        var mesh = leafMesh
+        if mesh?.width != trajectory.sheetWidth || mesh?.height != trajectory.sheetHeight {
+            mesh = Self.makeLeafMesh(
                 device: device, width: trajectory.sheetWidth, height: trajectory.sheetHeight
-            ) else {
-                curlLog.error("overlay not prepared: the leaf mesh was not allocated")
-                return false
-            }
-            leafMesh = mesh
+            )
+        }
+        guard let mesh else {
+            curlLog.error("overlay not prepared: the leaf mesh was not allocated")
+            return false
         }
 
+        // Assigned only once nothing can fail, so a failed prepare leaves no snapshots in the view.
+        currentTexture = current
+        targetTexture = target
+        leafMesh = mesh
         self.trajectory = trajectory
         scene = CurlScene(isSpread: request.isSpread, forward: request.forward)
         duration = configuration.duration
@@ -261,26 +269,20 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         )
     }
 
-    /// Writes the snapshot's pixels into `reusing` when it has the same size, otherwise into a new
-    /// texture.
-    static func loadSnapshot(
-        _ image: UIImage, reusing: MTLTexture?, device: MTLDevice
+    /// A new texture with the snapshot's pixels. It is never written again, so a frame still on the
+    /// GPU can read it while the next turn is prepared.
+    static func makeTexture(
+        from image: UIImage, device: MTLDevice
     ) throws(SnapshotLoadFailure) -> MTLTexture {
         let raster = try SnapshotRaster(image)
-        let texture: MTLTexture
-        if let reusing, reusing.width == raster.width, reusing.height == raster.height {
-            texture = reusing
-        } else {
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: SnapshotRaster.pixelFormat, width: raster.width, height: raster.height,
-                mipmapped: false
-            )
-            descriptor.usage = .shaderRead
-            descriptor.storageMode = .shared
-            guard let made = device.makeTexture(descriptor: descriptor) else {
-                throw .textureNotAllocated
-            }
-            texture = made
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: SnapshotRaster.pixelFormat, width: raster.width, height: raster.height,
+            mipmapped: false
+        )
+        descriptor.usage = .shaderRead
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw .textureNotAllocated
         }
         raster.bytes.withUnsafeBytes { bytes in
             texture.replace(
@@ -336,12 +338,12 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
         isPaused = true
         finished = true
         onFinished = nil
-    }
-
-    func releaseTextures() {
-        lastCommandBuffer = nil
+        // A submitted frame keeps its own references to the textures it reads.
         currentTexture = nil
         targetTexture = nil
+    }
+
+    func releaseRenderTargets() {
         multisampleTexture = nil
         depthTexture = nil
     }
@@ -468,7 +470,15 @@ extension PageCurlOverlayView: MTKViewDelegate {
             commandBuffer.present(drawable)
             commandBuffer.commit()
         }
-        lastCommandBuffer = commandBuffer
         return nil
+    }
+}
+
+/// The curl view's form of a loaded snapshot.
+final class SnapshotTexture: LoadedSnapshot {
+    let texture: MTLTexture
+
+    init(texture: MTLTexture) {
+        self.texture = texture
     }
 }
