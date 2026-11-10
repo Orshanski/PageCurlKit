@@ -132,7 +132,13 @@ final class PageCurlOverlayViewTests: XCTestCase {
             let started = view.startIfFirstFrameDrawn()
             view.stop()
             let texture = try XCTUnwrap(started ? drawn : nil, "The first frame was not drawn")
-            // A copy on the same queue starts only after the frame has written the texture.
+            // A copy on the same queue starts only after the frame has written the texture, but only
+            // when Metal tracks that texture; otherwise the pixel could be read before the write.
+            XCTAssertEqual(
+                texture.hazardTrackingMode, .tracked,
+                "The frame texture is not tracked (mode \(texture.hazardTrackingMode.rawValue)), so its pixel cannot be read safely"
+            )
+            guard texture.hazardTrackingMode == .tracked else { return [] }
             let device = try XCTUnwrap(view.device)
             let pixel = try XCTUnwrap(device.makeBuffer(length: 4, options: .storageModeShared))
             let commands = try XCTUnwrap(view.commandQueue.makeCommandBuffer())
