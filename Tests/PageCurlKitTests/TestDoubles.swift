@@ -76,6 +76,8 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
     /// How many more snapshots load before loading starts to fail; nil — never fails.
     var successfulLoadsLeft: Int?
     private(set) var loads = 0
+    /// Like the real view: the turn's snapshots from `prepare` until `stop`.
+    private(set) var heldSnapshots: [LoadedSnapshot] = []
     private(set) var requests: [PageCurlOverlayRequest] = []
     /// Started animations, that is turns that went the animated way.
     private(set) var runs = 0
@@ -96,6 +98,7 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
             return false
         }
         requests.append(request)
+        heldSnapshots = [request.currentSpread, request.targetSpread]
         return true
     }
 
@@ -107,6 +110,7 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
 
     func stop() {
         onFinished = nil
+        heldSnapshots = []
     }
 
     func releaseRenderTargets() {

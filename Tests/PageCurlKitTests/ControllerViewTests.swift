@@ -22,6 +22,34 @@ final class ControllerViewTests: ControllerTestCase {
         XCTAssertEqual(overlay.renderTargetReleases, 1, "Going to the background frees the render targets")
     }
 
+    func testViewHoldsNoSnapshotsAfterTheTurnEnds() async {
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertEqual(overlay.heldSnapshots.count, 2, "The running turn holds its snapshots")
+        await waitUntil("show under the overlay") { host.showTargetCalls.count == 1 }
+        overlay.finish()
+        XCTAssertTrue(overlay.heldSnapshots.isEmpty, "A finished turn leaves nothing in the view")
+        await host.drain()
+    }
+
+    func testViewHoldsNoSnapshotsAfterANewTurnInterrupts() async {
+        controller.turn(forward: true, isSpread: false)
+        await waitUntil("first show") { host.showTargetCalls.count == 1 }
+        controller.turn(forward: true, isSpread: false)
+        XCTAssertEqual(overlay.runs, 1, "The repeat call goes the instant way")
+        XCTAssertTrue(overlay.heldSnapshots.isEmpty, "An interrupted turn leaves nothing in the view")
+        await host.drain()
+    }
+
+    func testViewHoldsNoSnapshotsAfterBackgroundMidTurn() async {
+        controller.turn(forward: true, isSpread: false)
+        await waitUntil("show") { host.showTargetCalls.count == 1 }
+        NotificationCenter.default.post(
+            name: UIApplication.didEnterBackgroundNotification, object: nil
+        )
+        XCTAssertTrue(overlay.heldSnapshots.isEmpty, "Nothing stays in the view in the background")
+        await host.drain()
+    }
+
     func testRequestDescribesTheTurn() async {
         host.paperColor = .black
         container.backgroundColor = .white

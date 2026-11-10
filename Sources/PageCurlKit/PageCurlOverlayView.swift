@@ -220,10 +220,9 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
               let target = (request.targetSpread as? SnapshotTexture)?.texture
         else {
             curlLog.error("overlay not prepared: the snapshots were not loaded by a curl view")
+            assertionFailure("The snapshots of a turn must come from load(_:) of a curl view")
             return false
         }
-        currentTexture = current
-        targetTexture = target
 
         var red: CGFloat = 1, green: CGFloat = 1, blue: CGFloat = 1, alpha: CGFloat = 1
         request.paperColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
@@ -231,17 +230,21 @@ public final class PageCurlOverlayView: MTKView, PageCurlOverlayAnimating {
             sizePoints: sizePoints, isSpread: request.isSpread, forward: request.forward,
             paper: (Float(red), Float(green), Float(blue)), configuration: configuration
         )
-        if leafMesh?.width != trajectory.sheetWidth || leafMesh?.height != trajectory.sheetHeight {
-            leafMesh = nil
-            guard let mesh = Self.makeLeafMesh(
+        var mesh = leafMesh
+        if mesh?.width != trajectory.sheetWidth || mesh?.height != trajectory.sheetHeight {
+            mesh = Self.makeLeafMesh(
                 device: device, width: trajectory.sheetWidth, height: trajectory.sheetHeight
-            ) else {
-                curlLog.error("overlay not prepared: the leaf mesh was not allocated")
-                return false
-            }
-            leafMesh = mesh
+            )
+        }
+        guard let mesh else {
+            curlLog.error("overlay not prepared: the leaf mesh was not allocated")
+            return false
         }
 
+        // Assigned only once nothing can fail, so a failed prepare leaves no snapshots in the view.
+        currentTexture = current
+        targetTexture = target
+        leafMesh = mesh
         self.trajectory = trajectory
         scene = CurlScene(isSpread: request.isSpread, forward: request.forward)
         duration = configuration.duration
