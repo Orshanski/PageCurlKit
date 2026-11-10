@@ -74,7 +74,6 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private func enterBackground() {
-        // Set first: the interruption schedules a rebuild that runs after this handler.
         isInBackground = true
         interrupt(reason: "app went to the background")
         overlay?.releaseTextures()
