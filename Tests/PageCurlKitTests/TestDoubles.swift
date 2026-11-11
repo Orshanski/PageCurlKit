@@ -146,6 +146,8 @@ class ControllerTestCase: XCTestCase {
     var overlay: FakeOverlay { factory.overlay }
     /// Advancing this clock ends the minimum interval between turns without waiting.
     var time: CFTimeInterval = 1000
+    /// Work the controller asked to run later; the test runs it to stand for the delay passing.
+    var delayedWork: [(delay: CFTimeInterval, work: @MainActor () -> Void)] = []
 
     override func setUp() async throws {
         try await super.setUp()
@@ -167,6 +169,9 @@ class ControllerTestCase: XCTestCase {
         )
         controller.now = { [weak self] in self?.time ?? 0 }
         controller.afterFrameCommit = { work in work() }
+        delayedWork = []
+        controller.afterDelay = { [weak self] delay, work in self?.delayedWork.append((delay, work)) }
+        controller.onNextPass = { work in work() }
         // Lets the size watcher record the initial size so the first layout is not seen as a resize.
         container.layoutIfNeeded()
     }

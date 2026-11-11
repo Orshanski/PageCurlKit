@@ -4,7 +4,7 @@ import UIKit
 /// paper color is not here: it comes from `PageCurlHost.paperColor`.
 public struct PageCurlConfiguration {
     /// Animation length. Also the minimum interval between completed turns: a turn requested sooner
-    /// happens instantly.
+    /// happens instantly, and the snapshots for the next curl wait until no tap came for this long.
     public var duration: CFTimeInterval = 0.45
 
     /// Initial curl radius for a spread, as a fraction of the sheet width.

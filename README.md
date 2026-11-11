@@ -153,9 +153,14 @@ final class MiniPagerViewController: UIViewController, PageCurlHost {
 
 - **`prefetch()`** — after every show and after a neighbour becomes ready.
   Otherwise every curl pays for on-the-spot snapshot assembly (~0.1 s on
-  an iPad). The library drops the snapshots in the background and on a memory
-  warning. On return to the foreground it rebuilds them by itself; after a
-  memory warning they come back with the next `prefetch()` or turn.
+  an iPad). Snapshots are taken one per run loop pass, so the screen updates
+  and taps get through between them; a tap stops the rest. During rapid
+  tapping (a tap within `duration` of the previous show) each tap shows the
+  page instantly and `prefetch()` takes nothing; the snapshots are taken once
+  the taps stop for `duration`. The library drops the snapshots in the
+  background and on a memory warning. On return to the foreground it
+  rebuilds them by itself; after a memory warning they come back with the
+  next `prefetch()` or turn.
 - **`warmUp()`** — when the pager opens.
 - **`interrupt()`** — on host events incompatible with letting the animation
   finish: shows that bypass the library (table of contents, position
