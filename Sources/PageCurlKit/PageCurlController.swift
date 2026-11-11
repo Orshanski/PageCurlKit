@@ -27,11 +27,29 @@ public final class PageCurlController<Host: PageCurlHost> {
     private var holdContinuation: CheckedContinuation<Void, Never>?
     /// Set only after a confirmed show, so a tap at the edge of the book does not block the next turn.
     private var lastShownAt: CFTimeInterval = 0
+    /// Rapid tapping: each tap shows the neighbour at once and nothing is snapshotted until the taps
+    /// stop for `duration`. A snapshot takes longer than the gap between such taps.
+    private var isInSeries = false
+    private var seriesNumber = 0
+    /// A tap stops the snapshots still left in the running background capture.
+    private var captureNumber = 0
+    /// The direction of the last tap; the background capture takes that neighbour first.
+    private var lastForward = true
 
-    // Tests replace the clock and the wait for the frame commit.
+    // Tests replace the clock, the wait for the frame commit, the delay and the next run loop pass.
     var now: () -> CFTimeInterval = { CACurrentMediaTime() }
     var afterFrameCommit: (@escaping @MainActor () -> Void) -> Void = { work in
         CATransaction.setCompletionBlock {
+            MainActor.assumeIsolated(work)
+        }
+    }
+    var afterDelay: (CFTimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            MainActor.assumeIsolated(work)
+        }
+    }
+    var onNextPass: (@escaping @MainActor () -> Void) -> Void = { work in
+        DispatchQueue.main.async {
             MainActor.assumeIsolated(work)
         }
     }
@@ -70,7 +88,7 @@ public final class PageCurlController<Host: PageCurlHost> {
             UIApplication.willEnterForegroundNotification: { [weak self] in self?.enterForeground() },
             // A running curl holds its own two snapshots until it stops, so dropping the cache does
             // not break it.
-            UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.cache = nil },
+            UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.dropCache() },
         ])
     }
 
@@ -109,6 +127,9 @@ public final class PageCurlController<Host: PageCurlHost> {
         progress: PageCurlProgressSource = .timed
     ) {
         let touchedAt = CACurrentMediaTime()
+        // A curl shows its target as it starts, so a tap during a curl also falls in this window.
+        let isTooRecent = now() - lastShownAt <= configuration.duration
+        noteTap(forward: forward, isInSeries: isTooRecent)
         // A call during a running curl cancels it and then proceeds as usual.
         interrupt(reason: "a new turn")
         guard let host, let container else { return }
@@ -122,7 +143,7 @@ public final class PageCurlController<Host: PageCurlHost> {
         guard host.canTurn() else {
             return enqueueInstantShow(forward: forward, host: host, reason: "host is busy", isFailure: false)
         }
-        guard now() - lastShownAt > configuration.duration else {
+        guard !isTooRecent else {
             return enqueueInstantShow(forward: forward, host: host, reason: "previous turn too recent", isFailure: false)
         }
         guard let overlay = curlView() else {
@@ -183,10 +204,11 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     /// Call after each show and when a neighbour that was not ready becomes ready; otherwise each
-    /// turn snapshots the spreads on the spot.
+    /// turn snapshots the spreads on the spot. During rapid tapping it does nothing: the snapshots
+    /// are taken once the taps stop.
     public func prefetch() {
         // During a curl the main thread is busy with frames; release() restarts the rebuild.
-        guard activeRun == nil else { return }
+        guard activeRun == nil, !isInSeries else { return }
         // After the frame commits: rebuilding in the same run loop pass would stall the first
         // frames of the animation.
         afterFrameCommit { [weak self] in
@@ -197,7 +219,13 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// Drops the cache when the content changed without a position change, for example after
     /// relayout or a theme change.
     public func invalidate() {
+        dropCache()
+    }
+
+    /// Also cancels the unfinished background capture: its next step could snapshot the old layout.
+    private func dropCache() {
         cache = nil
+        captureNumber += 1
     }
 
     /// Stops a running curl. Call it when something makes the animation stale, for example a show
@@ -268,33 +296,76 @@ public final class PageCurlController<Host: PageCurlHost> {
         return cache?.pair(forward: forward)
     }
 
-    private func rebuildCache() {
-        guard activeRun == nil, !isInBackground, let host, let container else { return }
-        let size = container.bounds.size
-        guard size.width > 0, size.height > 0, let overlay = curlView() else { return }
-        fillCache(host: host, size: size, overlay: overlay, directions: [true, false])
+    /// Any tap stops the background capture. A tap too soon after a show starts or extends the
+    /// series; the series ends `duration` after its last tap, and only then the capture starts.
+    private func noteTap(forward: Bool, isInSeries: Bool) {
+        lastForward = forward
+        captureNumber += 1
+        seriesNumber += 1
+        self.isInSeries = isInSeries
+        guard isInSeries else { return }
+        let series = seriesNumber
+        afterDelay(configuration.duration) { [weak self] in
+            guard let self, self.seriesNumber == series else { return }
+            self.isInSeries = false
+            self.prefetch()
+        }
     }
 
-    /// Snapshots what the cache lacks: the spread on screen if the cache is for another position or
-    /// size, and the missing neighbours in `directions` (true — ahead).
+    private func rebuildCache() {
+        captureNumber += 1
+        captureStep(capture: captureNumber, directions: [lastForward, !lastForward])
+    }
+
+    /// One snapshot per run loop pass, so the screen updates and taps get through between them.
+    private func captureStep(capture: Int, directions: [Bool]) {
+        guard capture == captureNumber, activeRun == nil, !isInSeries, !isInBackground,
+              let host, let container
+        else { return }
+        let size = container.bounds.size
+        guard size.width > 0, size.height > 0, let overlay = curlView() else { return }
+        var remaining = directions
+        guard snapshotOneMissing(host: host, size: size, overlay: overlay, directions: &remaining) else {
+            return
+        }
+        onNextPass { [weak self] in
+            self?.captureStep(capture: capture, directions: remaining)
+        }
+    }
+
     private func fillCache(
         host: Host, size: CGSize, overlay: PageCurlOverlayAnimating, directions: [Bool]
     ) {
+        var remaining = directions
+        while snapshotOneMissing(host: host, size: size, overlay: overlay, directions: &remaining) {}
+    }
+
+    /// Takes one snapshot the cache lacks: first the spread on screen if the cache is for another
+    /// position or size, then the next missing neighbour in `directions` (true — ahead), which it
+    /// removes from the list. False when nothing was taken.
+    private func snapshotOneMissing(
+        host: Host, size: CGSize, overlay: PageCurlOverlayAnimating, directions: inout [Bool]
+    ) -> Bool {
         let position = host.currentPosition
         if cache?.isValid(for: position, size: size) != true {
             guard let view = host.currentSpreadView(),
                   let current = snapshot(of: view, size: size, paper: host.paperColor, into: overlay)
             else {
                 cache = nil
-                return
+                return false
             }
             cache = SnapshotCache(position: position, size: size, current: current)
+            return true
         }
-        for forward in directions where cache?.neighbour(forward: forward) == nil {
+        while !directions.isEmpty {
+            let forward = directions.removeFirst()
+            guard cache?.neighbour(forward: forward) == nil else { continue }
             let neighbour = host.neighbourSpreadView(forward: forward)
                 .flatMap { snapshot(of: $0, size: size, paper: host.paperColor, into: overlay) }
             cache?.setNeighbour(neighbour, forward: forward)
+            return true
         }
+        return false
     }
 
     /// The Metal view is opaque, so transparent pixels would turn black; paper is drawn underneath.
