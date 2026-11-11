@@ -90,9 +90,11 @@ final class ControllerRapidTapsTests: ControllerTestCase {
         endSeries()
         XCTAssertEqual(pendingPasses.count, 1, "The spread on screen is taken, the neighbours wait")
 
+        // An instant show outside a series: nothing but the tap itself stops the capture.
         time += 10
+        host.canTurnOverride = false
         controller.turn(forward: true, isSpread: false)
-        XCTAssertEqual(overlay.runs, 2, "A tap after a pause curls")
+        XCTAssertEqual(overlay.runs, 1, "A busy host gets an instant show")
         let neighbourCalls = host.neighbourCalls
         let loads = overlay.loads
         runNextPass()
@@ -100,9 +102,22 @@ final class ControllerRapidTapsTests: ControllerTestCase {
         XCTAssertEqual(host.neighbourCalls, neighbourCalls, "No snapshot after the tap")
         XCTAssertEqual(overlay.loads, loads)
 
-        await waitUntil("show under the overlay") { host.showTargetCalls.count == 4 }
-        overlay.finish()
+        await waitUntil("instant show") { host.showTargetCalls.count == 4 }
         await host.drain()
+    }
+
+    func testInvalidateStopsTheRestOfTheCapture() async {
+        holdPasses()
+        controller.prefetch()
+        XCTAssertEqual(pendingPasses.count, 1, "The spread on screen is taken, the neighbours wait")
+        let currentCalls = host.currentViewCalls
+        let neighbourCalls = host.neighbourCalls
+
+        controller.invalidate()
+        runNextPass()
+        XCTAssertTrue(pendingPasses.isEmpty, "The capture stopped")
+        XCTAssertEqual(host.currentViewCalls, currentCalls, "No snapshot of the old layout")
+        XCTAssertEqual(host.neighbourCalls, neighbourCalls)
     }
 
     func testTapAfterTheCaptureCurlsWithReadySnapshots() async {

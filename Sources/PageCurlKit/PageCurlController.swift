@@ -88,7 +88,7 @@ public final class PageCurlController<Host: PageCurlHost> {
             UIApplication.willEnterForegroundNotification: { [weak self] in self?.enterForeground() },
             // A running curl holds its own two snapshots until it stops, so dropping the cache does
             // not break it.
-            UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.cache = nil },
+            UIApplication.didReceiveMemoryWarningNotification: { [weak self] in self?.dropCache() },
         ])
     }
 
@@ -219,7 +219,13 @@ public final class PageCurlController<Host: PageCurlHost> {
     /// Drops the cache when the content changed without a position change, for example after
     /// relayout or a theme change.
     public func invalidate() {
+        dropCache()
+    }
+
+    /// Also cancels the unfinished background capture: its next step could snapshot the old layout.
+    private func dropCache() {
         cache = nil
+        captureNumber += 1
     }
 
     /// Stops a running curl. Call it when something makes the animation stale, for example a show
