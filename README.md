@@ -20,7 +20,7 @@ Two API layers:
 iOS 17+, Swift 6. Add the package with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "1.2.0")
+.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "2.0.0")
 ```
 
 ## Every call turns the page
