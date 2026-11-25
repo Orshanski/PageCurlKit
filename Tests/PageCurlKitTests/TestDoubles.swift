@@ -65,7 +65,9 @@ final class FakeHost: PageCurlHost {
     }
 }
 
-final class FakeSnapshot: LoadedSnapshot {}
+final class FakeSnapshot: LoadedSnapshot {
+    var showsSpineBand = false
+}
 
 /// No Metal; one view for all turns, like the real one. The test finishes the animation itself.
 @MainActor
@@ -92,6 +94,10 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
         return FakeSnapshot()
     }
 
+    func loadInBackground(_ snapshot: UIImage, completion: @escaping @MainActor (LoadedSnapshot?) -> Void) {
+        completion(load(snapshot))
+    }
+
     func prepare(_ request: PageCurlOverlayRequest) -> Bool {
         if failNextPrepare {
             failNextPrepare = false
@@ -106,6 +112,12 @@ final class FakeOverlay: UIView, PageCurlOverlayAnimating {
         guard !failFirstFrame else { return false }
         runs += 1
         return true
+    }
+
+    func prepareAhead(sizePoints: CGSize, scale: CGFloat, configuration: PageCurlConfiguration) {}
+
+    func afterFramesShown(_ count: Int, _ action: @escaping @MainActor () -> Void) {
+        action()
     }
 
     func stop() {

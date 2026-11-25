@@ -10,9 +10,6 @@ final class DemoReaderViewController: UIViewController {
     private var firstPage = 0
     private var spreadView: UIView?
     private var spineShadowView: SpineShadowView?
-    /// Sliders fire on every tick, and re-snapshotting three spreads per tick makes the screen stutter,
-    /// so the cache rebuild is delayed.
-    private var spineRebuildTask: Task<Void, Never>?
     private var curl: PageCurlController<DemoReaderViewController>?
     private var lastLaidOutSize: CGSize = .zero
     private let pagesContainer = UIView()
@@ -46,19 +43,9 @@ final class DemoReaderViewController: UIViewController {
         }
         settingsPanel.onChange = { [weak self] config in
             guard let self, let curl = self.curl else { return }
-            let spineChanged = curl.configuration.spineShadow != config.spineShadow
             curl.configuration = config
-            guard spineChanged else { return }
-            // The visible shadow follows the slider at once; rebuilding the snapshots that include
-            // it waits until the slider stops.
-            applySpineShadow(config.spineShadow)
-            spineRebuildTask?.cancel()
-            spineRebuildTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(400))
-                guard !Task.isCancelled, let self, let curl = self.curl else { return }
-                curl.invalidate()
-                curl.prefetch()
-            }
+            // The spine band follows the lamp and the shadow's strength too.
+            applySpineShadow(config)
         }
         settingsPanel.isHidden = true
         view.addSubview(settingsPanel)
@@ -76,6 +63,7 @@ final class DemoReaderViewController: UIViewController {
             settingsButton.heightAnchor.constraint(equalToConstant: 36),
             settingsPanel.topAnchor.constraint(equalTo: settingsButton.bottomAnchor, constant: 8),
             settingsPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            settingsPanel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
         ])
     }
 
@@ -114,21 +102,21 @@ final class DemoReaderViewController: UIViewController {
         spineShadowView = spread.subviews.compactMap { $0 as? SpineShadowView }.first
     }
 
-    private func applySpineShadow(_ style: SpineShadowStyle?) {
+    private func applySpineShadow(_ configuration: PageCurlConfiguration) {
         guard let spreadView, pagesPerSpread == 2 else { return }
-        guard let style else {
+        guard configuration.spineShadow != nil else {
             spineShadowView?.removeFromSuperview()
             spineShadowView = nil
             return
         }
         let shadow = spineShadowView ?? {
-            let created = SpineShadowView(style: style)
+            let created = SpineShadowView(configuration: configuration)
             spreadView.addSubview(created)
             spineShadowView = created
             return created
         }()
-        shadow.style = style
-        shadow.frame = SpineShadowView.frame(forSpreadBounds: spreadView.bounds, style: style)
+        shadow.configuration = configuration
+        shadow.frame = SpineShadowView.frame(forSpreadBounds: spreadView.bounds, configuration: configuration)
     }
 
     private func makeSpreadView(firstPage: Int, size: CGSize) -> UIView {
@@ -146,9 +134,9 @@ final class DemoReaderViewController: UIViewController {
             )
             spread.addSubview(page)
         }
-        if capacity == 2, let style = curl?.configuration.spineShadow {
-            let shadow = SpineShadowView(style: style)
-            shadow.frame = SpineShadowView.frame(forSpreadBounds: spread.bounds, style: style)
+        if capacity == 2, let configuration = curl?.configuration, configuration.spineShadow != nil {
+            let shadow = SpineShadowView(configuration: configuration)
+            shadow.frame = SpineShadowView.frame(forSpreadBounds: spread.bounds, configuration: configuration)
             spread.addSubview(shadow)
         }
         return spread
@@ -158,33 +146,73 @@ final class DemoReaderViewController: UIViewController {
         let page = UIView()
         page.backgroundColor = paperColor
 
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .justified
+        paragraph.firstLineHeadIndent = 24
+        paragraph.lineSpacing = 3
+        paragraph.hyphenationFactor = 1
+        let body = NSAttributedString(
+            string: Self.pageText(index: index),
+            attributes: [
+                .font: UIFont(name: "Georgia", size: 19) ?? .systemFont(ofSize: 19),
+                .foregroundColor: UIColor(white: 0.1, alpha: 1),
+                .paragraphStyle: paragraph,
+            ]
+        )
+        let text = UILabel()
+        text.attributedText = body
+        text.numberOfLines = 0
+        text.lineBreakMode = .byTruncatingTail
+        text.translatesAutoresizingMaskIntoConstraints = false
+        text.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        page.addSubview(text)
+
         let number = UILabel()
         number.text = "\(index + 1)"
-        number.font = .systemFont(ofSize: 180, weight: .thin)
-        number.textColor = UIColor(
-            hue: CGFloat(index) / CGFloat(pageCount), saturation: 0.55,
-            brightness: 0.72, alpha: 1
-        )
+        number.font = .systemFont(ofSize: 15)
+        number.textColor = .gray
         number.textAlignment = .center
         number.translatesAutoresizingMaskIntoConstraints = false
         page.addSubview(number)
 
-        let caption = UILabel()
-        caption.text = "page \(index + 1) of \(pageCount)"
-        caption.font = .systemFont(ofSize: 17)
-        caption.textColor = .darkGray
-        caption.textAlignment = .center
-        caption.translatesAutoresizingMaskIntoConstraints = false
-        page.addSubview(caption)
-
         NSLayoutConstraint.activate([
+            text.topAnchor.constraint(equalTo: page.topAnchor, constant: 64),
+            text.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 56),
+            text.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -56),
+            text.bottomAnchor.constraint(lessThanOrEqualTo: number.topAnchor, constant: -24),
             number.centerXAnchor.constraint(equalTo: page.centerXAnchor),
-            number.centerYAnchor.constraint(equalTo: page.centerYAnchor, constant: -20),
-            caption.centerXAnchor.constraint(equalTo: page.centerXAnchor),
-            caption.topAnchor.constraint(equalTo: number.bottomAnchor, constant: 8),
+            number.bottomAnchor.constraint(equalTo: page.bottomAnchor, constant: -32),
         ])
         return page
     }
+
+    /// Every page starts at its own paragraph, so neighbouring pages differ while they turn.
+    private static func pageText(index: Int) -> String {
+        let paragraphs = sampleText.components(separatedBy: "\n")
+        let shift = index % paragraphs.count
+        return (Array(paragraphs[shift...]) + Array(paragraphs[..<shift])).joined(separator: "\n")
+    }
+
+    private static let sampleText = """
+    Дорога шла вдоль реки, и с каждой верстой берег становился круче. Ямщик молчал, изредка \
+    поглядывая на небо, где с запада медленно надвигалась тяжёлая серая туча. Лошади шли ровно, \
+    колокольчик под дугой звенел глухо, будто издалека.
+    Станционный дом показался только к вечеру: низкий, с покосившимся крыльцом и тусклым огнём \
+    в окне. Смотритель долго разглядывал подорожную, потом вздохнул и сказал, что лошадей нет и \
+    до утра не будет. Спорить было бесполезно, и путник, отряхнув снег с шинели, прошёл в комнату.
+    В комнате пахло дымом и сушёными яблоками. На стене висели картинки в простых рамках, на столе \
+    стоял самовар, давно остывший. Хозяйская дочь, девочка лет двенадцати, принесла свечу и, \
+    не сказав ни слова, исчезла за перегородкой.
+    Путник сел у окна. За стеклом метель уже разыгралась всерьёз: дорогу замело, ближние деревья \
+    едва угадывались в белой мгле. Он подумал, что, пожалуй, и к лучшему задержаться здесь: письмо, \
+    которое он вёз, могло подождать ещё день, а усталость за последнюю неделю накопилась такая, \
+    что хотелось только тишины.
+    Смотритель вернулся с охапкой дров, разжёг печь и, присев на лавку, принялся рассказывать о \
+    прежних временах, когда по этой дороге ездили чаще, а станция была шумной и людной. Рассказ \
+    тянулся неторопливо, как сама дорога, и путник слушал вполуха, глядя на огонь.
+    Под утро метель стихла. Небо очистилось, и над лесом поднялось холодное солнце. Лошадей \
+    привели, ямщик, другой, помоложе, весело прикрикнул, и сани снова побежали вдоль реки.
+    """
 }
 
 // MARK: - Taps on the panel and the gear must not turn pages

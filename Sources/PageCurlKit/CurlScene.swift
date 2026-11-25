@@ -71,17 +71,18 @@ struct CurlScene: Equatable {
 
 /// The flat leaf as a grid in sheet points, wound counter-clockwise on screen.
 struct LeafMeshGeometry {
-    static let rows = 24
+    /// The leaf bends along both directions, so its grid is fine both ways.
+    static let leafStep: Float = 2
+    /// The shadow's outline is blurred anyway, so its grid can be coarse.
+    static let shadowStep: Float = 8
 
-    let columns: Int
     /// Four floats per vertex: x, y in sheet points and u, v in the snapshot.
     let vertices: [Float]
     let indices: [UInt32]
 
-    /// About 5 pt between columns, across the fold where the sheet bends; rows can be coarse.
-    init(width: Float, height: Float) {
-        let columns = max(2, Int(width / 5))
-        let rows = Self.rows
+    init(width: Float, height: Float, step: Float) {
+        let columns = max(2, Int((width / step).rounded()))
+        let rows = max(2, Int((height / step).rounded()))
         var vertices: [Float] = []
         vertices.reserveCapacity((columns + 1) * (rows + 1) * 4)
         for row in 0...rows {
@@ -103,7 +104,6 @@ struct LeafMeshGeometry {
                 indices.append(contentsOf: [a, c, b, b, c, d])
             }
         }
-        self.columns = columns
         self.vertices = vertices
         self.indices = indices
     }
