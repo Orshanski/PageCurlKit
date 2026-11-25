@@ -7,6 +7,7 @@ enum SnapshotLoadFailure: String, Error {
     case redrawFailed = "the image could not be redrawn as 8-bit BGRA"
     case noPixelBytes = "the bitmap gave no pixel bytes"
     case textureNotAllocated = "the texture was not allocated"
+    case smallerCopiesNotMade = "the smaller copies of the snapshot were not made"
 }
 
 /// A snapshot's pixels as the curl reads them: 8 bits per channel, BGRA in memory, alpha first,

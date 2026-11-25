@@ -20,7 +20,7 @@ Two API layers:
 iOS 17+, Swift 6. Add the package with Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "1.2.0")
+.package(url: "https://github.com/Orshanski/PageCurlKit.git", from: "2.0.0")
 ```
 
 ## Every call turns the page
@@ -185,11 +185,34 @@ final class MiniPagerViewController: UIViewController, PageCurlHost {
 
 ## Configuration
 
-`PageCurlConfiguration`: duration (which is also the quiet window), curl
-radii, cone strength, shadow, back-mirror opacity, frame rate (0 — device
-maximum). Mutable on a live controller; applies starting with the next curl.
+`PageCurlConfiguration`, mutable on a live controller; applies starting with
+the next curl:
+
+- **Timing** — `duration`, which is also the quiet window;
+  `preferredFramesPerSecond` (0 — device maximum).
+- **Shape** — `coneShare` (−1 tight at the bottom corner, 0 a cylinder, +1
+  tight at the top corner), `cylinderRadiusScale`, `coneReturnsAfterRelease`,
+  `eyeDistance` (in screen heights: nearer makes the lifted leaf grow more).
+- **Lamp** — `lampAngle` and `lampElevation`: one lamp for the leaf's tone,
+  its shadow and the spine.
+- **Tone** — `leafTone`: how much the leaf darkens where it turns away from
+  the lamp; 0 — off.
+- **Shadow** — `shadow` (`CurlShadowStyle`: on or off, strength, softening per
+  point of height, widest and narrowest soft edge). The strength also sets the
+  spine band's depth and stays when the shadow is off.
+- **Spine** — `spineShadow` (`SpineShadowStyle`, see below; nil — off).
+- **Single page** — `backMirrorOpacity`: how much the page shows through its
+  back.
+
 There is no paper color in the configuration — it comes from
 `PageCurlHost.paperColor`.
+
+Version 2.0.0 breaks this interface: the curl radii, cone strength and shadow
+strength of 1.x are gone; `SpineShadowStyle.strength` is gone too — the
+spine's depth is now the leaf shadow's strength; `SpineShadowView` takes the
+whole configuration instead of a style. Defaults changed: `duration` 0.45 →
+0.75 s (it is also the quiet window), `backMirrorOpacity` 0.22 → 0.5,
+`SpineShadowStyle.width` 44 → 32.
 
 On an iPhone with a ProMotion display the curl runs above 60 frames per
 second only if the app's `Info.plist` sets
@@ -232,17 +255,20 @@ overlay.start()
 
 ## Spine shadow
 
-`SpineShadowView` — the soft gradient down the middle of a two-page spread,
-like the fold of a paper book. Configured by `configuration.spineShadow`
-(`SpineShadowStyle`: band width, peak darkening; nil — off). The host lays it
-out on the spread itself, centered on the spine, full height; snapshots then
-carry it into the curl automatically. Changing the style means redrawing the
-spread and calling `invalidate()` — the shadow is baked into snapshots.
+`SpineShadowView` — the soft band down the middle of a two-page spread, like
+the fold of a paper book. Configured by `configuration.spineShadow`
+(`SpineShadowStyle`: band width, how much the lamp changes it; nil — off; its
+depth at the spine is the leaf shadow's strength): the side turned away from the lamp is a little deeper, the
+other a little lighter. The host lays it out on the spread itself, centered on
+the spine, full height. The curl leaves it out of its snapshots and draws the
+same band itself, on the still pages and on the turning leaf.
 
 ```swift
-if let style = curl.configuration.spineShadow, isSpread {
-    let shadow = SpineShadowView(style: style)
-    shadow.frame = SpineShadowView.frame(forSpreadBounds: spreadView.bounds, style: style)
+if curl.configuration.spineShadow != nil, isSpread {
+    let shadow = SpineShadowView(configuration: curl.configuration)
+    shadow.frame = SpineShadowView.frame(
+        forSpreadBounds: spreadView.bounds, configuration: curl.configuration
+    )
     spreadView.addSubview(shadow)
 }
 ```

@@ -1,73 +1,60 @@
 import XCTest
 @testable import PageCurlKit
 
-/// At both ends of the trajectory the sheet must be flat: the fold is past the sheet edge and the
-/// shadow is gone.
+/// At both ends of the trajectory the sheet must be flat: on its own side at the start, on the
+/// other side at the end.
 final class CurlTrajectoryTests: XCTestCase {
 
-    private func spread(
-        radiusFraction: Float = 0.16, shadowStrength: Float = 0.30, backMirrorOpacity: Float = 0.22
-    ) -> CurlTrajectory {
-        CurlTrajectory(
-            sheetWidth: 400, sheetHeight: 600, screenHalfWidth: 400,
-            isSpread: true, direction: 1, paper: (1, 1, 1),
-            startRadiusFraction: radiusFraction, coneStrength: 0.05,
-            shadowStrength: shadowStrength, backMirrorOpacity: backMirrorOpacity
+    private func spread(backMirrorOpacity: CGFloat = 0.22) -> CurlTrajectory {
+        var configuration = PageCurlConfiguration()
+        configuration.backMirrorOpacity = backMirrorOpacity
+        return CurlTrajectory(
+            sizePoints: CGSize(width: 800, height: 600), isSpread: true, forward: true,
+            paper: (1, 1, 1), configuration: configuration
         )
     }
 
     private func single() -> CurlTrajectory {
         CurlTrajectory(
-            sheetWidth: 800, sheetHeight: 600, screenHalfWidth: 400,
-            isSpread: false, direction: 1, paper: (1, 1, 1),
-            startRadiusFraction: 0.10, coneStrength: 0.05,
-            shadowStrength: 0.30, backMirrorOpacity: 0.22
+            sizePoints: CGSize(width: 800, height: 600), isSpread: false, forward: true,
+            paper: (1, 1, 1), configuration: PageCurlConfiguration()
         )
     }
 
     func testStartFrameIsFlat() {
         for trajectory in [spread(), single()] {
             let u = trajectory.uniforms(atProgress: 0)
-            XCTAssertGreaterThan(
-                u.foldX, trajectory.sheetWidth,
-                "At t=0 the fold is beyond the far edge — the sheet is flat"
-            )
-            XCTAssertEqual(u.shadowAmp, 0, accuracy: 0.001, "No shadow at the flat end")
-            XCTAssertEqual(u.k, 0, accuracy: 0.001, "No cone at the flat end")
+            XCTAssertEqual(u.theta, .pi / 2, "At t=0 the cone is flat")
+            XCTAssertEqual(u.rotation, 0, "At t=0 the leaf lies on its own side")
         }
     }
 
     func testSpreadEndFrameIsExactMirror() {
         let trajectory = spread()
         let u = trajectory.uniforms(atProgress: 1)
-        XCTAssertEqual(u.foldX, 0, accuracy: 0.001, "The fold reached the spine")
-        XCTAssertEqual(u.r0, 1, accuracy: 0.001, "The radius decayed: the leaf lies as an exact mirror")
-        XCTAssertEqual(u.shadowAmp, 0, accuracy: 0.001)
+        XCTAssertEqual(u.theta, .pi / 2, "The leaf is flat again: it lies as an exact mirror")
+        XCTAssertEqual(u.rotation, .pi, "The leaf lies on the other side of the spine")
     }
 
     func testSingleEndFrameIsBeyondLeftEdge() {
         let trajectory = single()
         let u = trajectory.uniforms(atProgress: 1)
-        XCTAssertLessThan(u.foldX, 0, "The single leaf left the screen entirely")
-        XCTAssertEqual(u.shadowAmp, 0, accuracy: 0.001)
+        XCTAssertEqual(u.rotation, .pi, "The single leaf turned past the left edge and left the screen")
+        XCTAssertEqual(u.theta, .pi / 2)
     }
 
     func testConeRisesMidwayAndSubsides() {
         let trajectory = spread()
         let mid = trajectory.uniforms(atProgress: 0.5)
-        XCTAssertGreaterThan(mid.k, 0, "The cone rises midway")
-        XCTAssertGreaterThan(mid.shadowAmp, 0, "The shadow is visible midway")
+        XCTAssertLessThan(mid.theta, .pi / 2, "The cone rises midway")
     }
 
     // MARK: - From a turn
 
     private func turn(isSpread: Bool, forward: Bool) -> CurlTrajectory {
-        var configuration = PageCurlConfiguration()
-        configuration.spreadStartRadiusFraction = 0.2
-        configuration.singleStartRadiusFraction = 0.1
-        return CurlTrajectory(
+        CurlTrajectory(
             sizePoints: CGSize(width: 800, height: 600), isSpread: isSpread, forward: forward,
-            paper: (1, 1, 1), configuration: configuration
+            paper: (1, 1, 1), configuration: PageCurlConfiguration()
         )
     }
 
@@ -78,13 +65,11 @@ final class CurlTrajectoryTests: XCTestCase {
         XCTAssertEqual(turn(isSpread: false, forward: false).direction, 1, "Single backward reverses time instead")
     }
 
-    func testSheetAndRadiusFollowTheKindOfTurn() {
+    func testSheetFollowsTheKindOfTurn() {
         let spread = turn(isSpread: true, forward: true)
         XCTAssertEqual(spread.sheetWidth, 400, "A spread's leaf is half the screen")
-        XCTAssertEqual(spread.curlStartRadius, 400 * 0.2, accuracy: 0.001, "Spread radius fraction")
         let single = turn(isSpread: false, forward: true)
         XCTAssertEqual(single.sheetWidth, 800, "A single leaf is the whole screen")
-        XCTAssertEqual(single.curlStartRadius, 800 * 0.1, accuracy: 0.001, "Single-page radius fraction")
         for trajectory in [spread, single] {
             XCTAssertEqual(trajectory.screenHalfWidth, 400)
             XCTAssertEqual(trajectory.sheetHeight, 600)
@@ -92,13 +77,7 @@ final class CurlTrajectoryTests: XCTestCase {
     }
 
     func testConfigurationDrivesGeometry() {
-        let standard = spread()
-        XCTAssertGreaterThan(spread(radiusFraction: 0.30).curlStartRadius, standard.curlStartRadius)
-
-        let mid = standard.uniforms(atProgress: 0.5)
-        XCTAssertGreaterThan(
-            spread(shadowStrength: 0.60).uniforms(atProgress: 0.5).shadowAmp, mid.shadowAmp
-        )
+        let mid = spread().uniforms(atProgress: 0.5)
         XCTAssertNotEqual(
             spread(backMirrorOpacity: 0.5).uniforms(atProgress: 0.5).backMix, mid.backMix
         )

@@ -64,6 +64,10 @@ final class PageCurlOverlayViewTests: XCTestCase {
             frames.prepare(current: red, target: blue, forward: true)
             view.stop()
         }
+        // The smaller copies are built on the GPU, which holds the snapshots until it is done.
+        let done = try XCTUnwrap(view.commandQueue.makeCommandBuffer())
+        done.commit()
+        done.waitUntilCompleted()
         XCTAssertNil(current, "After stop() the view keeps no snapshot of the turn")
         XCTAssertNil(target, "After stop() the view keeps no snapshot of the turn")
     }

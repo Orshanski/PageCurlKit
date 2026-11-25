@@ -12,7 +12,15 @@ public enum PageCurlProgressSource: Equatable {
 @MainActor
 public final class PageCurlController<Host: PageCurlHost> {
 
-    public var configuration: PageCurlConfiguration
+    public var configuration: PageCurlConfiguration {
+        didSet {
+            // Each snapshot remembers whether its spread had the spine band; turning the band on or
+            // off makes that stale.
+            guard (oldValue.spineShadow == nil) != (configuration.spineShadow == nil) else { return }
+            dropCache()
+            prefetch()
+        }
+    }
 
     private weak var host: Host?
     private weak var container: UIView?
@@ -55,6 +63,7 @@ public final class PageCurlController<Host: PageCurlHost> {
     }
 
     private var cache: SnapshotCache<Host.Position, LoadedSnapshot>?
+    private static var framesBeforeShow: Int { 3 }
 
     private let sizeSentinel = ContainerSizeSentinel()
     private var appWatcher: AppNotificationWatcher?
@@ -184,6 +193,15 @@ public final class PageCurlController<Host: PageCurlHost> {
         // would keep a closed host and the Metal textures alive if it is dismissed mid-curl.
         host.enqueue { [weak self, weak host] in
             guard let host else { return }
+            // The host lays out the target under the curl only after the first frames are on
+            // screen, so its work does not take their time.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                guard let self, self.activeRun == run, let overlay = self.overlay else {
+                    continuation.resume()
+                    return
+                }
+                overlay.afterFramesShown(Self.framesBeforeShow) { continuation.resume() }
+            }
             let shown = await Self.show(forward: forward, host: host) { [weak self] in self }
             if !shown {
                 // The host provided a neighbour view but then could not show it: an integration bug.
@@ -212,8 +230,17 @@ public final class PageCurlController<Host: PageCurlHost> {
         // After the frame commits: rebuilding in the same run loop pass would stall the first
         // frames of the animation.
         afterFrameCommit { [weak self] in
+            self?.prepareAhead()
             self?.rebuildCache()
         }
+    }
+
+    private func prepareAhead() {
+        guard !isInBackground, let container, let overlay = curlView() else { return }
+        overlay.prepareAhead(
+            sizePoints: container.bounds.size, scale: SnapshotRaster.rendererFormat().scale,
+            configuration: configuration
+        )
     }
 
     /// Drops the cache when the content changed without a position change, for example after
@@ -317,19 +344,56 @@ public final class PageCurlController<Host: PageCurlHost> {
         captureStep(capture: captureNumber, directions: [lastForward, !lastForward])
     }
 
-    /// One snapshot per run loop pass, so the screen updates and taps get through between them.
+    /// One snapshot at a time: the view is drawn into an image here, its pixels go into the curl
+    /// view's memory off the main thread, and the next one starts on the next run loop pass.
     private func captureStep(capture: Int, directions: [Bool]) {
         guard capture == captureNumber, activeRun == nil, !isInSeries, !isInBackground,
               let host, let container
         else { return }
         let size = container.bounds.size
         guard size.width > 0, size.height > 0, let overlay = curlView() else { return }
-        var remaining = directions
-        guard snapshotOneMissing(host: host, size: size, overlay: overlay, directions: &remaining) else {
+        let position = host.currentPosition
+        func next(_ remaining: [Bool]) {
+            onNextPass { [weak self] in
+                self?.captureStep(capture: capture, directions: remaining)
+            }
+        }
+        if cache?.isValid(for: position, size: size) != true {
+            guard let view = host.currentSpreadView() else {
+                cache = nil
+                return
+            }
+            let drawn = draw(view, size: size, paper: host.paperColor)
+            overlay.loadInBackground(drawn.image) { [weak self] loaded in
+                guard let self, capture == self.captureNumber else { return }
+                guard let loaded else {
+                    self.cache = nil
+                    return
+                }
+                loaded.showsSpineBand = drawn.hasSpineBand
+                self.cache = SnapshotCache(position: position, size: size, current: loaded)
+                next(directions)
+            }
             return
         }
-        onNextPass { [weak self] in
-            self?.captureStep(capture: capture, directions: remaining)
+        var remaining = directions
+        while !remaining.isEmpty {
+            let forward = remaining.removeFirst()
+            guard cache?.neighbour(forward: forward) == nil else { continue }
+            guard let view = host.neighbourSpreadView(forward: forward) else {
+                cache?.setNeighbour(nil, forward: forward)
+                return next(remaining)
+            }
+            let drawn = draw(view, size: size, paper: host.paperColor)
+            overlay.loadInBackground(drawn.image) { [weak self] loaded in
+                guard let self, capture == self.captureNumber,
+                      self.cache?.isValid(for: position, size: size) == true
+                else { return }
+                loaded?.showsSpineBand = drawn.hasSpineBand
+                self.cache?.setNeighbour(loaded, forward: forward)
+                next(remaining)
+            }
+            return
         }
     }
 
@@ -368,18 +432,36 @@ public final class PageCurlController<Host: PageCurlHost> {
         return false
     }
 
-    /// The Metal view is opaque, so transparent pixels would turn black; paper is drawn underneath.
+    private static func spineShadowViews(in view: UIView) -> [SpineShadowView] {
+        if let spine = view as? SpineShadowView { return [spine] }
+        return view.subviews.flatMap { spineShadowViews(in: $0) }
+    }
+
+    /// Loads on the spot, for a turn that finds no snapshot ready.
     private func snapshot(
         of view: UIView, size: CGSize, paper: UIColor, into overlay: PageCurlOverlayAnimating
     ) -> LoadedSnapshot? {
+        let drawn = draw(view, size: size, paper: paper)
+        let loaded = overlay.load(drawn.image)
+        loaded?.showsSpineBand = drawn.hasSpineBand
+        return loaded
+    }
+
+    /// The Metal view is opaque, so transparent pixels would turn black; paper is drawn underneath.
+    private func draw(_ view: UIView, size: CGSize, paper: UIColor) -> (image: UIImage, hasSpineBand: Bool) {
         assert(view.bounds.size == size, "The host spread view must match the container size")
         view.layoutIfNeeded()
+        // The curl draws the spine band itself: on the still halves it takes the darker of the band
+        // and the leaf's shadow, which a band baked into the snapshot cannot.
+        let spines = Self.spineShadowViews(in: view).filter { !$0.isHidden }
+        spines.forEach { $0.isHidden = true }
+        defer { spines.forEach { $0.isHidden = false } }
         let image = UIGraphicsImageRenderer(size: size, format: SnapshotRaster.rendererFormat()).image { context in
             paper.setFill()
             context.fill(CGRect(origin: .zero, size: size))
             view.layer.render(in: context.cgContext)
         }
-        return overlay.load(image)
+        return (image, !spines.isEmpty)
     }
 }
 

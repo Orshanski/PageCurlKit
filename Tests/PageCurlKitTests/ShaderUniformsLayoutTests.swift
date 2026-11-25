@@ -20,7 +20,7 @@ final class ShaderUniformsLayoutTests: XCTestCase {
     }
 
     func testLayoutIsTightFloats() {
-        XCTAssertEqual(MemoryLayout<CurlUniforms>.size, 16 * MemoryLayout<Float>.size)
+        XCTAssertEqual(MemoryLayout<CurlUniforms>.size, 28 * MemoryLayout<Float>.size)
         XCTAssertEqual(MemoryLayout<CurlUniforms>.stride, MemoryLayout<CurlUniforms>.size)
     }
 }

@@ -1,9 +1,9 @@
 // Page curl shaders. The source is compiled at runtime, so the package ships no Metal library
 // resource.
 //
-// The leaf has three zones: flat before the fold line, wrapped around a radius r(s) = r0 + k·s at
-// the fold, and lying mirrored at height 2r past the crest. The zones are real branches, not a
-// blend; the radius is clamped from below because d/r at r = 0 would give NaN.
+// The leaf is wrapped around a cone, a cylinder or a mix of the two, then turned about the spine
+// and seen in perspective. Source: Hong, Card, Chen, "Deforming Pages of 3D Electronic Books"
+// (2004), and Austin's page_curl::curlPage.
 //
 // Modes: spread (the leaf is half the screen, its axis at the spine, its back is the opposite half
 // of the target snapshot) and single page (the leaf is the whole screen, its axis at the left edge,
@@ -13,42 +13,115 @@ let pageCurlShaderSource = """
 using namespace metal;
 
 struct CurlUniforms {
-    float foldX;      // fold line at the bottom edge, sheet coordinates
-    float r0;         // bend radius at the bottom edge
-    float k;          // radius growth along the fold line (cone strength)
-    float halfWidth;  // half the SCREEN width, pt (for NDC)
-    float height;     // sheet height, pt
-    float zScale;     // height above the plane -> depth
-    float zEpsilon;   // lift above the background against z-fighting
-    float direction;  // +1 — the leaf moves left of its edge; −1 — mirrored
-    float originX;    // screen x of the leaf axis: spine (spread) or left edge
-    float isSingle;   // 1 — single page, 0 — spread
-    float backMix;    // single: how much text shows through the back
-    float paperR;     // single: paper color of the back
+    float theta;
+    float apexY;
+    float rotation;
+    float conic;
+    float cylinderRadius;
+    float width;        // sheet width, pt
+    float height;       // sheet and screen height, pt
+    float eyeDistance;  // pt
+    float direction;    // +1 — the leaf moves left of its edge; −1 — mirrored
+    float originX;      // screen x of the leaf axis: spine (spread) or left edge
+    float halfWidth;    // half the SCREEN width, pt
+    float isSingle;
+    float backMix;      // single: how much text shows through the back
+    float paperR;       // single: paper color of the back
     float paperG;
     float paperB;
-    float shadowAmp;  // cast shadow strength (0 at the trajectory ends)
-    float pad1;
+    float shadowStrength;
+    float shadowShiftX;
+    float shadowShiftY;
+    float shadowSoftening;
+    float shadowMaxWidth;
+    float shadowMinimumWidth;
+    float shadowTopLevel;
+    float lampX;
+    float lampY;
+    float lampZ;
+    float leafTone;
+    float gutterHalfWidth;
 };
 
-// Light from above-and-front, like a lamp over a book. No lateral component
-// on purpose: with one, forward and backward curls would be lit on different
-// sides of the roll (physical, but reads as asymmetry).
-constant float3 curlLight = float3(0.0, -0.28, 0.96);
+// The table of PageLight.shaderTable, laid out by PageLight.
+constant int toneSamples = \(PageLight.toneSamples);
+constant float lowestCosine = \(PageLight.lowestCosine);
+constant int gutterSamples = \(PageLight.bandSamples);
+constant int gutterLeftStart = \(PageLight.leftBandStart);
+constant int gutterRightStart = \(PageLight.rightBandStart);
 
-struct VertexIn {
-    float2 sheet [[attribute(0)]];
-    float2 uv    [[attribute(1)]];
-};
+static float lookUp(constant float *table, int start, int count, float share) {
+    float f = clamp(share, 0.0, 1.0) * float(count - 1);
+    int i = min(int(f), count - 2);
+    return mix(table[start + i], table[start + i + 1], f - float(i));
+}
+
+static float gutterAt(
+    float d, int start, constant CurlUniforms &u, constant float *table, float outside
+) {
+    if (u.gutterHalfWidth <= 0.0 || d >= u.gutterHalfWidth) {
+        return outside;
+    }
+    return lookUp(table, start, gutterSamples, d / u.gutterHalfWidth);
+}
+
+static float lampTone(float3 normal, constant CurlUniforms &u, constant float *table) {
+    float cosine = dot(normal, float3(u.lampX, u.lampY, u.lampZ));
+    return lookUp(table, 0, toneSamples, (cosine - lowestCosine) / (u.lampZ - lowestCosine));
+}
+
+// Half a step of noise hides the steps of 8-bit output on smooth grey.
+static float3 withNoise(float3 color, float2 pixel) {
+    float noise = fract(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    return color + noise / 255.0;
+}
 
 struct LeafVaryings {
     float4 position [[position]];
     float2 faceUV;
     float2 backUV;
-    // Surface brightness from the bend (cone-normal self-shading);
-    // interpolation over the fine mesh is enough.
-    float shade;
+    float2 sheet;
+    // The face's normal in screen axes, not normalized: interpolated along the triangle and
+    // normalized at each point.
+    float3 normal;
 };
+
+// Sheet point (x from the spine, y from the top edge) to the leaf in space: x across the screen
+// away from the spine, y down, z toward the reader.
+static float3 curlPoint(float x, float y, constant CurlUniforms &u) {
+    // Precise functions and 2·sin²(a/2) in place of 1 − cos(a): near a flat leaf the angles are
+    // tiny and the radius huge, and the fast ones give a lift of tens of points out of nothing.
+    // The cone tight at the bottom is the top one with the sheet turned upside down.
+    bool bottom = u.conic < 0.0;
+    float yc = bottom ? u.height - y : y;
+    float sinT = precise::sin(u.theta);
+    float R = length(float2(x, yc - u.apexY));
+    float r = R * sinT;
+    float beta = precise::asin(min(x / R, 1.0)) / sinT;
+    float halfBeta = precise::sin(0.5 * beta);
+    float sag = 2.0 * r * halfBeta * halfBeta;
+    float3 cone = float3(
+        r * precise::sin(beta),
+        R + u.apexY - sag * sinT,
+        sag * precise::cos(u.theta)
+    );
+    if (bottom) {
+        cone.y = u.height - cone.y;
+    }
+
+    float b = x / u.cylinderRadius;
+    float halfB = precise::sin(0.5 * b);
+    float3 cylinder = float3(
+        u.cylinderRadius * precise::sin(b),
+        y,
+        2.0 * u.cylinderRadius * halfB * halfB
+    );
+
+    float3 t = mix(cylinder, cone, abs(u.conic));
+    float sinR = precise::sin(u.rotation);
+    float cosR = precise::cos(u.rotation);
+    return float3(t.x * cosR - t.z * sinR, t.y, t.x * sinR + t.z * cosR);
+}
 
 vertex LeafVaryings leaf_vertex(
     const device float4 *vertices [[buffer(0)]],
@@ -56,63 +129,28 @@ vertex LeafVaryings leaf_vertex(
     uint vid [[vertex_id]]
 ) {
     float4 v = vertices[vid];
-    float x = v.x;
-    float y = v.y;
-    // s — along the fold line from the bottom edge, d — across, toward the
-    // curl.
-    float s = u.height - y;
-    float d = x - u.foldX;
+    float3 p = curlPoint(v.x, v.y, u);
 
-    float px;
-    float pz;
-    float shade = 1.0;
-    // Flat-area lighting uses the same formula as the roll at θ=0: the zone
-    // seams must meet without a visible edge.
-    float flatLit = clamp(dot(float3(0.0, 0.0, 1.0), normalize(curlLight)), 0.0, 1.0);
-    float flatShade = 0.72 + 0.28 * flatLit;
-    if (d <= 0.0) {
-        px = x;
-        pz = 0.0;
-        // Slight darkening of the flat part next to the fold: the rising
-        // roll shades it from the light. Matches the roll start at d=0.
-        shade = flatShade * (1.0 - 0.08 * exp(d / max(u.r0, 8.0)));
-    } else {
-        float r = max(u.r0 + u.k * s, 0.75);
-        float arc = M_PI_F * r;
-        if (d <= arc) {
-            float theta = d / r;
-            px = u.foldX + sin(theta) * r;
-            pz = (1.0 - cos(theta)) * r;
-            // Cone normal in screen axes: (−dir·sinθ, 0, cosθ); lit by
-            // curlLight with some ambient so the turned edge is not black.
-            float3 normal = float3(-u.direction * sin(theta), 0.0, cos(theta));
-            float lit = clamp(dot(normal, normalize(curlLight)), 0.0, 1.0);
-            shade = 0.72 + 0.28 * lit;
-            // The roll's shading fades as the sheet rises — values match the
-            // flat part at the boundary.
-            shade *= 1.0 - 0.08 * (1.0 - smoothstep(0.0, 0.6, theta));
-            // Toward the crest, blend into the settled overturn's lighting.
-            shade = mix(shade, 0.97, smoothstep(2.4, M_PI_F, theta));
-        } else {
-            px = u.foldX - (d - arc);
-            pz = 2.0 * r;
-            // The settled overturn is lit evenly, slightly dimmed.
-            shade = 0.97;
-        }
-    }
-    // Normalize by flat-area lighting: the far field of the sheet is exactly
-    // 1.0 (the t=0 frame matches the live spread pixel for pixel), and the
-    // zone seams stay continuous under a common divisor.
-    shade = min(shade / flatShade, 1.0);
+    // The eye is above the screen centre; points on the screen plane stay where they are.
+    float2 screen = float2(u.originX + u.direction * p.x, p.y);
+    float2 centre = float2(u.halfWidth, 0.5 * u.height);
+    screen = centre + (screen - centre) * (u.eyeDistance / (u.eyeDistance - p.z));
 
-    float sx = u.originX + u.direction * px;
     LeafVaryings out;
     out.position = float4(
-        sx / u.halfWidth - 1.0,
-        1.0 - 2.0 * (y / u.height),
-        clamp(pz * u.zScale + u.zEpsilon, 0.0, 0.999),
+        screen.x / u.halfWidth - 1.0,
+        1.0 - 2.0 * (screen.y / u.height),
+        // The flat leaf sits just above the background against z-fighting.
+        clamp(p.z / (2.0 * u.width) + 0.002, 0.0, 0.999),
         1.0
     );
+    out.sheet = v.xy;
+    // The surface's slope from the leaf's own shape, 2 pt apart along the sheet.
+    float3 alongX = curlPoint(v.x + 2.0, v.y, u) - p;
+    float3 alongY = curlPoint(v.x, v.y + 2.0, u) - p;
+    alongX.x *= u.direction;
+    alongY.x *= u.direction;
+    out.normal = normalize(cross(alongX, alongY)) * u.direction;
     // Snapshot rows are stored top-down: v=0 is the snapshot's top.
     if (u.isSingle > 0.5) {
         // The leaf is the whole snapshot; the back samples the same point:
@@ -125,8 +163,38 @@ vertex LeafVaryings leaf_vertex(
         out.faceUV = float2(0.5 + u.direction * 0.5 * v.z, v.w);
         out.backUV = float2(0.5 - u.direction * 0.5 * v.z, v.w);
     }
-    out.shade = shade;
     return out;
+}
+
+constexpr sampler snapshotSampler(
+    mag_filter::linear, min_filter::linear, mip_filter::linear,
+    max_anisotropy(8), address::clamp_to_edge
+);
+
+static float4 leafColor(
+    LeafVaryings in, bool isFront, constant CurlUniforms &u,
+    texture2d<float> faceTex, texture2d<float> backTex
+) {
+    if (isFront) {
+        return faceTex.sample(snapshotSampler, in.faceUV);
+    }
+    if (u.isSingle > 0.5) {
+        // Translucent mirror: theme paper with a hint of the leaf's text.
+        float4 ink = faceTex.sample(snapshotSampler, in.backUV);
+        float3 paper = float3(u.paperR, u.paperG, u.paperB);
+        return float4(mix(paper, ink.rgb, u.backMix), 1.0);
+    }
+    return backTex.sample(snapshotSampler, in.backUV);
+}
+
+static float leafTone(
+    float3 faceNormal, bool isFront, constant CurlUniforms &u, constant float *gutter
+) {
+    if (u.leafTone <= 0.0) {
+        return 1.0;
+    }
+    float3 normal = normalize(faceNormal);
+    return lampTone(isFront ? normal : -normal, u, gutter);
 }
 
 fragment float4 leaf_fragment(
@@ -134,31 +202,87 @@ fragment float4 leaf_fragment(
     bool isFront [[front_facing]],
     constant CurlUniforms &u [[buffer(1)]],
     texture2d<float> faceTex [[texture(0)]],
-    texture2d<float> backTex [[texture(1)]]
+    texture2d<float> backTex [[texture(1)]],
+    constant float *gutter [[buffer(2)]],
+    constant float2 &spineBand [[buffer(3)]]
 ) {
-    constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-    if (isFront) {
-        float4 c = faceTex.sample(smp, in.faceUV);
-        return float4(c.rgb * in.shade, c.a);
+    float4 c = leafColor(in, isFront, u, faceTex, backTex);
+    bool hasBand = (isFront ? spineBand.x : spineBand.y) > 0.5;
+    // The spine's band goes with the side of the leaf: the face starts on its own page, the back
+    // lands on the other one.
+    bool onLeftPage = isFront == (u.direction < 0.0);
+    int start = onLeftPage ? gutterLeftStart : gutterRightStart;
+    float band = hasBand ? gutterAt(in.sheet.x, start, u, gutter, 1.0) : 1.0;
+    float tone = leafTone(in.normal, isFront, u, gutter) * band;
+    if (tone >= 1.0) {
+        return c;
     }
-    if (u.isSingle > 0.5) {
-        // Translucent mirror: theme paper with a hint of the leaf's text.
-        float4 ink = faceTex.sample(smp, in.backUV);
-        float3 paper = float3(u.paperR, u.paperG, u.paperB);
-        return float4(mix(paper, ink.rgb, u.backMix) * in.shade, 1.0);
-    }
-    float4 c = backTex.sample(smp, in.backUV);
-    return float4(c.rgb * in.shade, c.a);
+    return float4(withNoise(c.rgb * tone, in.position.xy), c.a);
 }
 
-// Background under the leaf: two halves for a spread (static and opening),
-// one full-screen snapshot for single mode. On top — the cast shadow: a soft
-// band under the fold roll and a band ahead of the settled overturn's edge
-// ("the shadow precedes the leaf"). Both analytic, no blur.
+// The leaf moved along the lamp's ray onto the page: red — covered, green — the leaf's height.
+struct ShadowVaryings {
+    float4 position [[position]];
+    float height;
+};
+
+vertex ShadowVaryings shadow_vertex(
+    const device float4 *vertices [[buffer(0)]],
+    constant CurlUniforms &u [[buffer(1)]],
+    uint vid [[vertex_id]]
+) {
+    float4 v = vertices[vid];
+    float3 p = curlPoint(v.x, v.y, u);
+    float2 page = float2(u.originX + u.direction * p.x, p.y)
+        + p.z * float2(u.shadowShiftX, u.shadowShiftY);
+    ShadowVaryings out;
+    out.position = float4(page.x / u.halfWidth - 1.0, 1.0 - 2.0 * (page.y / u.height), 0.0, 1.0);
+    out.height = max(p.z, 0.0);
+    return out;
+}
+
+fragment float2 shadow_fragment(ShadowVaryings in [[stage_in]]) {
+    return float2(1.0, in.height);
+}
+
+struct BlurVaryings {
+    float4 position [[position]];
+    float2 uv;
+};
+
+// One triangle over the whole target.
+vertex BlurVaryings fullscreen_vertex(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2);
+    BlurVaryings out;
+    out.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(p.x, 1.0 - p.y);
+    return out;
+}
+
+struct BlurStep {
+    float2 step;
+    float sigma;
+};
+
+fragment float2 blur_fragment(
+    BlurVaryings in [[stage_in]],
+    constant BlurStep &b [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]
+) {
+    constexpr sampler smp(filter::linear, address::clamp_to_edge);
+    float2 sum = 0.0;
+    float total = 0.0;
+    for (int i = -4; i <= 4; i++) {
+        float w = exp(-0.5 * float(i * i) / (b.sigma * b.sigma));
+        sum += w * source.sample(smp, in.uv + float(i) * b.step).rg;
+        total += w;
+    }
+    return sum / total;
+}
+
 struct BackgroundVaryings {
     float4 position [[position]];
     float2 uv;
-    float xNDC;
 };
 
 vertex BackgroundVaryings background_vertex(
@@ -169,38 +293,60 @@ vertex BackgroundVaryings background_vertex(
     BackgroundVaryings out;
     out.position = float4(v.x, v.y, 0.0, 1.0);
     out.uv = float2(v.z, v.w);
-    out.xNDC = v.x;
     return out;
+}
+
+constant int shadowLevelCount = \(CurlShadowLevels.count);
+constant float sharpBlur = \(CurlShadowLevels.sharpBlur);
+constant float firstBlur = \(CurlShadowLevels.firstBlur);
+constant float growth = \(Float(CurlShadowLevels.growth));
+constant int averagingLevel = \(CurlShadowLevels.averaging);
+
+// The shadow's soft edge, by the leaf's height. The snapshot's uv is also the place on the screen.
+static float shadowAt(
+    float2 uv, constant CurlUniforms &u,
+    array<texture2d<float>, shadowLevelCount> levels
+) {
+    constexpr sampler smp(filter::linear, address::clamp_to_edge);
+    // The leaf's height over this place, averaged around it.
+    float2 around = levels[averagingLevel].sample(smp, uv).rg;
+    float height = around.g / max(around.r, 1e-4);
+    float sigma = 0.5 * min(max(u.shadowSoftening * height, u.shadowMinimumWidth), u.shadowMaxWidth);
+    float level = sigma < firstBlur
+        ? max(sigma - sharpBlur, 0.0) / (firstBlur - sharpBlur)
+        : 1.0 + log2(sigma / firstBlur) / log2(growth);
+    level = clamp(level, 0.0, u.shadowTopLevel);
+    int below = int(floor(level));
+    int above = min(below + 1, int(u.shadowTopLevel));
+    float cover = mix(
+        levels[below].sample(smp, uv).r, levels[above].sample(smp, uv).r, level - float(below)
+    );
+    return u.shadowStrength * cover;
 }
 
 fragment float4 background_fragment(
     BackgroundVaryings in [[stage_in]],
     constant CurlUniforms &u [[buffer(1)]],
-    texture2d<float> tex [[texture(0)]]
+    texture2d<float> tex [[texture(0)]],
+    array<texture2d<float>, shadowLevelCount> shadowLevels [[texture(1)]],
+    constant float *gutter [[buffer(2)]],
+    constant float &spineBand [[buffer(3)]]
 ) {
-    constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-    float4 c = tex.sample(smp, in.uv);
-
-    float x = (in.xNDC + 1.0) * u.halfWidth;
-    float sheetW = (u.isSingle > 0.5) ? 2.0 * u.halfWidth : u.halfWidth;
-    float arc = M_PI_F * u.r0;
-
-    // The band under the fold roll.
-    float c1 = u.originX + u.direction * (u.foldX + u.r0);
-    float w1 = max(u.r0 * 2.2, 30.0);
-    float d1 = (x - c1) / w1;
-    float band1 = exp(-0.5 * d1 * d1);
-
-    // The band ahead of the settled overturn's edge; appears once the
-    // overturn exists.
-    float flipped = (sheetW - u.foldX) - arc;
-    float edgePx = u.foldX - flipped;
-    float c2 = u.originX + u.direction * edgePx;
-    float w2 = max(u.r0 * 1.2, 24.0);
-    float d2 = (x - c2) / w2;
-    float band2 = exp(-0.5 * d2 * d2) * smoothstep(0.0, 60.0, flipped) * 0.7;
-
-    float shadow = min(u.shadowAmp * (band1 + band2), 0.35);
-    return float4(c.rgb * (1.0 - shadow), c.a);
+    float4 c = tex.sample(snapshotSampler, in.uv);
+    float tone = 1.0;
+    if (u.gutterHalfWidth > 0.0 && spineBand > 0.5) {
+        float x = in.uv.x * 2.0 * u.halfWidth;
+        int start = x < u.halfWidth ? gutterLeftStart : gutterRightStart;
+        tone = gutterAt(abs(x - u.halfWidth), start, u, gutter, 1.0);
+    }
+    if (u.shadowStrength > 0.0) {
+        // Where the spine's band and the leaf's shadow meet, the darker of the two: both are the
+        // same shadow, so the spine does not jump when the leaf lifts.
+        tone = min(tone, 1.0 - shadowAt(in.uv, u, shadowLevels));
+    }
+    if (tone >= 1.0) {
+        return c;
+    }
+    return float4(withNoise(c.rgb * tone, in.position.xy), c.a);
 }
 """
